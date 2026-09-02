@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { createChart, AreaSeries } from 'lightweight-charts';
+import { createChart, LineSeries, AreaSeries, CandlestickSeries } from 'lightweight-charts';
 import { OptionsChain, PositionsTable } from "./OptionsChainModal";
 import { SideTabs } from './SideTabs';
 
-// --- Helper to parse date strings into Date objects for comparison ---
+// Helper to parse date strings or unix timestamps into Date objects
 const parseSimDate = (dateVal) => {
   if (!dateVal) return new Date();
   if (typeof dateVal === 'number') {
@@ -12,13 +12,12 @@ const parseSimDate = (dateVal) => {
   return new Date(dateVal);
 };
 
-// --- Helper to calculate Days To Expiration (DTE) relative to simulator date ---
+// Helper to calculate Days To Expiration (DTE) relative to simulator date
 const calculateSimDTE = (expirationStr, currentSimDateStr) => {
   if (!expirationStr || !currentSimDateStr) return 0;
   const exp = parseSimDate(expirationStr);
   const curr = parseSimDate(currentSimDateStr);
   
-  // Set both to midnight to compare full calendar days
   exp.setHours(0, 0, 0, 0);
   curr.setHours(0, 0, 0, 0);
 
@@ -26,34 +25,63 @@ const calculateSimDTE = (expirationStr, currentSimDateStr) => {
   return Math.max(-1, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
 };
 
-// --- Main App Component ---
 export default function App() {
   const chartContainerRef = useRef(null);
   const seriesRef = useRef(null);
   const chartRef = useRef(null);
-  const lastTimeRef = useRef(0);
   
-  const [currentPrice, setCurrentPrice] = useState(500.0);
-  const [priceChange, setPriceChange] = useState(0);
-  const [simulatedDate, setSimulatedDate] = useState(() => new Date().toISOString().slice(0, 10)); // Track simulator date
+  // Ticker Selection ('SPY' or 'QQQ')
+  const [selectedSymbol, setSelectedSymbol] = useState('SPY');
+  
+  // Ref to track current symbol inside persistent WebSocket callback
+  const selectedSymbolRef = useRef(selectedSymbol);
+  useEffect(() => {
+    selectedSymbolRef.current = selectedSymbol;
+  }, [selectedSymbol]);
+
+  // Ref tracking to enforce strictly increasing timestamps for Lightweight Charts
+  const spyLastTimeRef = useRef(0);
+  const qqqLastTimeRef = useRef(0);
+
+  // Persistent history refs
+  const spyHistoryRef = useRef([]); // Stores SPY line data [{ time, value }]
+  const qqqHistoryRef = useRef([]); // Stores QQQ candlestick data [{ time, open, high, low, close }]
+  const currentCandleRef = useRef(null); // Tracks active QQQ candle
+
+  // Multi-stock state tracking
+  const [marketPrices, setMarketPrices] = useState({ SPY: 450.0, QQQ: 380.0 });
+  const [priceChanges, setPriceChanges] = useState({ SPY: 0, QQQ: 0 });
+  const [simulatedDates, setSimulatedDates] = useState({ SPY: '', QQQ: '' });
+  
   const [logs, setLogs] = useState([]);
   
-  // Track open and closed positions separately
+  // Player state
   const [openPositions, setOpenPositions] = useState([]);
   const [closedPositions, setClosedPositions] = useState([]);
   const [activePositionsTab, setActivePositionsTab] = useState('OPEN');
-
   const [accountBalance, setAccountBalance] = useState(10000.0);
 
+  // Multi-stock NPC metrics
   const [npcStats, setNpcStats] = useState({
-    bull: { portfolio_value: 10000, cash: 10000, contracts: 0 },
-    bear: { portfolio_value: 10000, cash: 10000, contracts: 0 },
+    SPY: {
+      bull: { portfolio_value: 10000, cash: 10000, contracts: 0 },
+      bear: { portfolio_value: 10000, cash: 10000, contracts: 0 },
+    },
+    QQQ: {
+      bull: { portfolio_value: 10000, cash: 10000, contracts: 0 },
+      bear: { portfolio_value: 10000, cash: 10000, contracts: 0 },
+    }
   });
 
-  // Handle new order creation
+  const currentPrice = marketPrices[selectedSymbol] || 0;
+  const priceChange = priceChanges[selectedSymbol] || 0;
+  const simulatedDate = simulatedDates[selectedSymbol] || '';
+
+  // Handle new trade execution
   const handleExecuteTrade = (tradeData) => {
     const newPosition = {
       id: `pos_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      symbol: selectedSymbol,
       entryDate: simulatedDate,
       timestamp: simulatedDate || new Date().toISOString(),
       ...tradeData, 
@@ -61,9 +89,18 @@ export default function App() {
 
     setOpenPositions((prev) => [newPosition, ...prev]);
     setAccountBalance((prev) => prev - tradeData.totalCost);
+
+    setLogs((prev) => [
+      {
+        id: `log_${Date.now()}`,
+        text: `Player: BOUGHT ${tradeData.contracts}x ${selectedSymbol} $${tradeData.strike} ${tradeData.type}`,
+        symbol: selectedSymbol,
+      },
+      ...prev,
+    ]);
   };
 
-  // Handle manual close from PositionsTable
+  // Handle manual position close
   const handleClosePosition = (positionId, currentMark) => {
     const targetPos = openPositions.find((p) => p.id === positionId);
     if (!targetPos) return;
@@ -86,7 +123,7 @@ export default function App() {
     setAccountBalance((prev) => prev + finalPayout);
   };
 
-  // Auto-close expired positions based on the advancing simulation date
+  // Auto-close expired positions based on current simulation date
   useEffect(() => {
     if (!openPositions || openPositions.length === 0 || !simulatedDate) return;
 
@@ -95,15 +132,16 @@ export default function App() {
     let totalPayout = 0;
 
     openPositions.forEach((pos) => {
-      // Calculate DTE dynamically relative to the current tick's simulation date
-      const dte = calculateSimDTE(pos.expiration, simulatedDate);
+      const activeDate = simulatedDates[pos.symbol] || simulatedDate;
+      const dte = calculateSimDTE(pos.expiration, activeDate);
+      const activePrice = marketPrices[pos.symbol] || currentPrice;
 
       if (dte < 0) {
         let intrinsicPrice = 0;
         if (pos.type === 'CALL') {
-          intrinsicPrice = Math.max(0, currentPrice - pos.strike);
+          intrinsicPrice = Math.max(0, activePrice - pos.strike);
         } else {
-          intrinsicPrice = Math.max(0, pos.strike - currentPrice);
+          intrinsicPrice = Math.max(0, pos.strike - activePrice);
         }
 
         const finalPayout = intrinsicPrice * 100 * pos.contracts;
@@ -117,10 +155,9 @@ export default function App() {
           exitPrice: intrinsicPrice,
           finalPayout,
           realizedPnl,
-          closedAt: simulatedDate,
+          closedAt: activeDate,
         });
       } else {
-        // Update live DTE on the open position record
         remainingOpen.push({ ...pos, dte });
       }
     });
@@ -130,8 +167,183 @@ export default function App() {
       setClosedPositions((prev) => [...newlyClosed, ...prev]);
       setAccountBalance((prev) => prev + totalPayout);
     }
-  }, [simulatedDate, currentPrice]);
+  }, [simulatedDates, marketPrices]);
 
+  // --- 1. PERSISTENT WEBSOCKET CONNECTION (MOUNT ONCE) ---
+  useEffect(() => {
+    let isMounted = true;
+    const ws = new WebSocket('ws://localhost:8000/ws/stocks');
+
+    ws.onopen = () => {
+      // If React unmounted while the handshake was in-flight, close cleanly now that it's OPEN
+      if (!isMounted) {
+        ws.close();
+        return;
+      }
+      console.log('Connected to Stock WS');
+    };
+
+    ws.onmessage = (event) => {
+      if (!isMounted) return;
+
+      try {
+        const packet = JSON.parse(event.data);
+
+        if (packet.dates) {
+          setSimulatedDates({
+            SPY: packet.dates.SPY || '',
+            QQQ: packet.dates.QQQ || '',
+          });
+        }
+
+        if (packet.data) {
+          setMarketPrices((prev) => {
+            const nextSpy = packet.data.SPY ?? prev.SPY;
+            const nextQqq = packet.data.QQQ ?? prev.QQQ;
+            setPriceChanges({
+              SPY: nextSpy - prev.SPY,
+              QQQ: nextQqq - prev.QQQ,
+            });
+            return { SPY: nextSpy, QQQ: nextQqq };
+          });
+        }
+
+        // --- UPDATE SPY HISTORY (Daily Line / Area Series) ---
+        const spyPrice = packet.data?.SPY;
+        const spyDateStr = packet.dates?.SPY; // Format: "YYYY-MM-DD"
+
+        if (spyPrice !== undefined && spyPrice !== null && spyDateStr) {
+          const history = spyHistoryRef.current;
+          const lastPoint = history[history.length - 1];
+
+          if (!lastPoint || lastPoint.time < spyDateStr) {
+            // New date -> Push new point
+            const newPoint = { time: spyDateStr, value: spyPrice };
+            history.push(newPoint);
+
+            if (selectedSymbolRef.current === 'SPY' && seriesRef.current) {
+              seriesRef.current.update(newPoint);
+            }
+          } else if (lastPoint.time === spyDateStr) {
+            // Same date -> Update today's active price
+            const updatedPoint = { time: spyDateStr, value: spyPrice };
+            history[history.length - 1] = updatedPoint;
+
+            if (selectedSymbolRef.current === 'SPY' && seriesRef.current) {
+              seriesRef.current.update(updatedPoint);
+            }
+          }
+        }
+
+        // --- UPDATE QQQ HISTORY (5-Minute Candlestick Series) ---
+        const qqqPrice = packet.data?.QQQ;
+        const qqqDateStr = packet.dates?.QQQ; // Format: "YYYY-MM-DD HH:mm:ss" or ISO
+
+        if (qqqPrice !== undefined && qqqPrice !== null && qqqDateStr) {
+          // Replace space with 'T' for reliable parsing across browsers
+          const qqqTimeSec = Math.floor(new Date(qqqDateStr.replace(' ', 'T')).getTime() / 1000);
+
+          if (!isNaN(qqqTimeSec) && qqqTimeSec > 0) {
+            const bucketInterval = 300; // 5 minutes = 300s
+            const candleTime = Math.floor(qqqTimeSec / bucketInterval) * bucketInterval;
+            let activeCandle = currentCandleRef.current;
+
+            // Reject out-of-order historical packets if they go backward in time
+            if (!activeCandle || candleTime > activeCandle.time) {
+              const prevClose = activeCandle ? activeCandle.close : qqqPrice;
+              const newCandle = {
+                time: candleTime,
+                open: prevClose,
+                high: Math.max(prevClose, qqqPrice),
+                low: Math.min(prevClose, qqqPrice),
+                close: qqqPrice,
+              };
+              
+              qqqHistoryRef.current.push(newCandle);
+              currentCandleRef.current = newCandle;
+
+              if (selectedSymbolRef.current === 'QQQ' && seriesRef.current) {
+                seriesRef.current.update(newCandle);
+              }
+            } else if (candleTime === activeCandle.time) {
+              // Update ongoing active 5-minute candle
+              const updatedCandle = {
+                ...activeCandle,
+                high: Math.max(activeCandle.high, qqqPrice),
+                low: Math.min(activeCandle.low, qqqPrice),
+                close: qqqPrice,
+              };
+
+              qqqHistoryRef.current[qqqHistoryRef.current.length - 1] = updatedCandle;
+              currentCandleRef.current = updatedCandle;
+
+              if (selectedSymbolRef.current === 'QQQ' && seriesRef.current) {
+                seriesRef.current.update(updatedCandle);
+              }
+            }
+          }
+        }
+
+        // --- NPC STATS ---
+        if (packet.npcs) {
+          setNpcStats({
+            SPY: packet.npcs.SPY || { bull: {}, bear: {} },
+            QQQ: packet.npcs.QQQ || { bull: {}, bear: {} },
+          });
+        }
+
+        // --- TRADE ACTIVITY LOGS ---
+        let incomingLogs = packet.logs || packet.trades || packet.npc_trades || packet.activity || packet.messages || [];
+
+        if (packet.npcs) {
+          ['SPY', 'QQQ'].forEach((sym) => {
+            if (packet.npcs[sym]?.logs) incomingLogs = incomingLogs.concat(packet.npcs[sym].logs);
+            if (packet.npcs[sym]?.trades) incomingLogs = incomingLogs.concat(packet.npcs[sym].trades);
+            if (packet.npcs[sym]?.activity) incomingLogs = incomingLogs.concat(packet.npcs[sym].activity);
+          });
+        }
+
+        if (incomingLogs && Array.isArray(incomingLogs) && incomingLogs.length > 0) {
+          const formattedNewLogs = incomingLogs.map((item, idx) => {
+            const rawText = typeof item === 'string' ? item : (item.text || item.message || item.trade || JSON.stringify(item));
+            
+            let logSymbol = item.symbol || item.ticker || item.asset;
+            if (!logSymbol) {
+              if (rawText.includes('QQQ')) logSymbol = 'QQQ';
+              else if (rawText.includes('SPY')) logSymbol = 'SPY';
+              else logSymbol = selectedSymbolRef.current;
+            }
+
+            return {
+              id: `log_ws_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 4)}`,
+              text: rawText,
+              symbol: logSymbol,
+              isDivider: item.isDivider || false
+            };
+          });
+
+          setLogs((prev) => [...formattedNewLogs, ...prev].slice(0, 100));
+        }
+
+      } catch (err) {
+        console.error("Error parsing WebSocket packet:", err);
+      }
+    };
+
+    return () => {
+      isMounted = false;
+      ws.onmessage = null;
+
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      } else if (ws.readyState === WebSocket.CONNECTING) {
+        // Defer closing until the connection finishes establishing to prevent browser console warning
+        ws.onopen = () => ws.close();
+      }
+    };
+  }, []);
+
+  // --- 2. RENDER CHART UPON SYMBOL SELECTION ---
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -149,93 +361,50 @@ export default function App() {
       rightPriceScale: { borderColor: 'rgba(197, 203, 206, 0.8)' },
       timeScale: {
         borderColor: 'rgba(197, 203, 206, 0.8)',
-        timeVisible: false,
-        secondsVisible: false,
+        timeVisible: true,
+        secondsVisible: true,
       },
       localization: { dateFormat: 'yyyy-MM-dd' }
     });
 
-    const areaSeries = typeof chart.addAreaSeries === 'function'
-      ? chart.addAreaSeries({
-          topColor: 'rgba(38, 166, 154, 0.56)',
-          bottomColor: 'rgba(38, 166, 154, 0.04)',
-          lineColor: 'rgba(38, 166, 154, 1)',
-          lineWidth: 2,
-        })
-      : chart.addSeries(AreaSeries, {
-          topColor: 'rgba(38, 166, 154, 0.56)',
-          bottomColor: 'rgba(38, 166, 154, 0.04)',
-          lineColor: 'rgba(38, 166, 154, 1)',
-          lineWidth: 2,
-        });
+    let series;
+    if (selectedSymbol === 'SPY') {
+      series = typeof chart.addAreaSeries === 'function'
+        ? chart.addAreaSeries({
+            topColor: 'rgba(38, 166, 154, 0.56)',
+            bottomColor: 'rgba(38, 166, 154, 0.04)',
+            lineColor: '#26a69a',
+            lineWidth: 2,
+          })
+        : chart.addSeries(LineSeries, { color: '#26a69a', lineWidth: 2 });
+
+      if (spyHistoryRef.current.length > 0) {
+        series.setData(spyHistoryRef.current);
+      }
+    } else {
+      series = typeof chart.addCandlestickSeries === 'function'
+        ? chart.addCandlestickSeries({
+            upColor: '#26a69a',
+            downColor: '#ef5350',
+            borderVisible: false,
+            wickUpColor: '#26a69a',
+            wickDownColor: '#ef5350',
+          })
+        : chart.addSeries(CandlestickSeries, {
+            upColor: '#26a69a',
+            downColor: '#ef5350',
+            borderVisible: false,
+            wickUpColor: '#26a69a',
+            wickDownColor: '#ef5350',
+          });
+
+      if (qqqHistoryRef.current.length > 0) {
+        series.setData(qqqHistoryRef.current);
+      }
+    }
 
     chartRef.current = chart;
-    seriesRef.current = areaSeries;
-
-    const ws = new WebSocket('ws://localhost:8000/ws/stocks');
-
-    ws.onmessage = (event) => {
-      try {
-        const packet = JSON.parse(event.data);
-        const price = packet.data?.SPY;
-        const dateStr = packet.date || packet.timestamp || packet.data?.date;
-        
-        // if (dateStr) {
-        //   setSimulatedDate(dateStr); // Synchronize simulation date across app
-        // }
-        
-        if (dateStr) {
-          // If dateStr is a full timestamp or number, normalize to YYYY-MM-DD
-          const formattedDate = typeof dateStr === 'string' 
-            ? dateStr.slice(0, 10) 
-            : new Date(dateStr).toISOString().slice(0, 10);
-
-          setSimulatedDate(formattedDate);
-        }
-
-        let timeInSeconds = typeof dateStr === 'number' 
-          ? (dateStr > 1e11 ? Math.floor(dateStr / 1000) : dateStr)
-          : Math.floor(new Date(dateStr).getTime() / 1000);
-
-        if (price !== undefined && price !== null && !isNaN(timeInSeconds)) {
-          if (timeInSeconds >= lastTimeRef.current) {
-            lastTimeRef.current = timeInSeconds;
-            areaSeries.update({ time: timeInSeconds, value: price });
-          }
-
-          setCurrentPrice((prev) => {
-            if (prev !== null) setPriceChange(price - prev);
-            return price;
-          });
-        }
-
-        if (packet.npcs) {
-          setNpcStats({
-            bull: packet.npcs.bull || { portfolio_value: 0, cash: 0, contracts: 0 },
-            bear: packet.npcs.bear || { portfolio_value: 0, cash: 0, contracts: 0 },
-          });
-
-          const bullAction = packet.npcs.bull?.action;
-          const bearAction = packet.npcs.bear?.action;
-
-          if (bullAction || bearAction) {
-            setLogs((prevLogs) => {
-              const newEntries = [];
-              const lastLogDate = prevLogs.find((l) => l.date)?.date;
-              if (packet.is_new_day || (lastLogDate && lastLogDate !== dateStr)) {
-                newEntries.push({ id: `divider-${dateStr}-${Date.now()}`, isDivider: true, date: dateStr, text: ` ${dateStr}` });
-              }
-              if (bullAction) newEntries.push({ id: `${dateStr}-bull-${Math.random()}`, text: `Bull: ${bullAction}`, date: dateStr });
-              if (bearAction) newEntries.push({ id: `${dateStr}-bear-${Math.random()}`, text: `Bear: ${bearAction}`, date: dateStr });
-
-              return [...newEntries, ...prevLogs].slice(0, 25);
-            });
-          }
-        }
-      } catch (err) {
-        console.error("Error parsing WebSocket packet:", err);
-      }
-    };
+    seriesRef.current = series;
 
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current && chartContainerRef.current.clientWidth > 0) {
@@ -245,11 +414,19 @@ export default function App() {
     window.addEventListener('resize', handleResize);
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
       window.removeEventListener('resize', handleResize);
+      seriesRef.current = null;
+      chartRef.current = null;
       chart.remove();
     };
-  }, []);
+  }, [selectedSymbol]);
+
+  const activeNpc = npcStats[selectedSymbol] || { bull: {}, bear: {} };
+
+  // Filter logs for selected ticker
+  const filteredLogs = logs.filter(
+    (log) => !log.symbol || log.symbol === selectedSymbol
+  );
 
   // --- View: Dashboard Tab ---
   const dashboardView = (
@@ -260,13 +437,36 @@ export default function App() {
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
             QuantWorld Sandbox
           </h1>
-          <p style={{ margin: '4px 0 0 0', color: '#94a3b8', fontSize: '14px' }}>GBM Simulator + RL Agent Speculation</p>
+          <p style={{ margin: '4px 0 0 0', color: '#94a3b8', fontSize: '14px' }}>Multi-Asset GBM Simulator + RL Agent Speculation</p>
+        </div>
+
+        {/* Ticker Selector Buttons */}
+        <div style={{ display: 'flex', gap: '8px', backgroundColor: '#0f172a', padding: '4px', borderRadius: '8px', border: '1px solid #1e293b' }}>
+          {['SPY', 'QQQ'].map((symbol) => (
+            <button
+              key={symbol}
+              onClick={() => setSelectedSymbol(symbol)}
+              style={{
+                padding: '6px 16px',
+                borderRadius: '6px',
+                border: 'none',
+                backgroundColor: selectedSymbol === symbol ? '#38bdf8' : 'transparent',
+                color: selectedSymbol === symbol ? '#0f172a' : '#94a3b8',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+                fontSize: '13px',
+                transition: 'all 0.2s',
+              }}
+            >
+              {symbol} {symbol === 'QQQ' ? '(5m Candles)' : '(Ticks)'}
+            </button>
+          ))}
         </div>
         
         {currentPrice !== null && (
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: '12px', color: '#38bdf8', fontWeight: 'bold' }}>
-              SIM DATE: {simulatedDate ? String(simulatedDate) : 'Connecting...'}
+              SIM DATE ({selectedSymbol}): {simulatedDate ? String(simulatedDate) : 'Connecting...'}
             </div>
             <div style={{ fontSize: '28px', fontWeight: 'bold', color: '#f8fafc' }}>
               ${currentPrice.toFixed(2)}
@@ -279,47 +479,47 @@ export default function App() {
       </header>
 
       <div style={{ display: 'grid', gridTemplateColumns: '3fr 1fr', gap: '24px' }}>
-        {/* Left Side: The Chart */}
+        {/* Left Side: Chart */}
         <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '16px', border: '1px solid #1e293b' }}>
           <h2 style={{ fontSize: '16px', margin: '0 0 12px 0', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '6px' }}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
-            Daily Market Price
+            {selectedSymbol} {selectedSymbol === 'QQQ' ? 'Candlestick Chart (5-min)' : 'Area Chart'}
           </h2>
           <div ref={chartContainerRef} style={{ width: '100%' }} />
         </div>
 
-        {/* Right Side: Player Controls, NPC Metrics & Trading Log */}
+        {/* Right Side: Agent Metrics & Activity Log */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '12px', border: '1px solid #1e293b', borderTop: '3px solid #22c55e' }}>
-              <div style={{ fontSize: '12px', color: '#22c55e', fontWeight: 'bold', textTransform: 'uppercase' }}>Bull NPC</div>
+              <div style={{ fontSize: '12px', color: '#22c55e', fontWeight: 'bold', textTransform: 'uppercase' }}>Bull Agent ({selectedSymbol})</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f8fafc', margin: '4px 0' }}>
-                ${npcStats.bull.portfolio_value?.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                ${activeNpc.bull?.portfolio_value?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || '10,000.00'}
               </div>
-              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Cash: ${npcStats.bull.cash?.toFixed(2)}</div>
-              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Pos: {npcStats.bull.contracts} Contract(s)</div>
+              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Cash: ${activeNpc.bull?.cash?.toFixed(2) || '10000.00'}</div>
+              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Pos: {activeNpc.bull?.contracts || 0} Contract(s)</div>
             </div>
 
             <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '12px', border: '1px solid #1e293b', borderTop: '3px solid #ef4444' }}>
-              <div style={{ fontSize: '12px', color: '#ef4444', fontWeight: 'bold', textTransform: 'uppercase' }}>Bear NPC</div>
+              <div style={{ fontSize: '12px', color: '#ef4444', fontWeight: 'bold', textTransform: 'uppercase' }}>Bear Agent ({selectedSymbol})</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f8fafc', margin: '4px 0' }}>
-                ${npcStats.bear.portfolio_value?.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                ${activeNpc.bear?.portfolio_value?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || '10,000.00'}
               </div>
-              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Cash: ${npcStats.bear.cash?.toFixed(2)}</div>
-              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Pos: {npcStats.bear.contracts} Contract(s)</div>
+              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Cash: ${activeNpc.bear?.cash?.toFixed(2) || '10000.00'}</div>
+              <div style={{ fontSize: '11px', color: '#94a3b8' }}>Pos: {activeNpc.bear?.contracts || 0} Contract(s)</div>
             </div>
           </div>
 
           <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '16px', border: '1px solid #1e293b', display: 'flex', flexDirection: 'column', height: '345px' }}>
             <h2 style={{ fontSize: '15px', margin: '0 0 12px 0', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '6px' }}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-              Agent & Player Activity
+              {selectedSymbol} Activity Log
             </h2>
             <div style={{ flexGrow: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px', paddingRight: '4px' }}>
-              {logs.length === 0 ? (
+              {filteredLogs.length === 0 ? (
                 <p style={{ color: '#64748b', fontSize: '13px', fontStyle: 'italic' }}>Waiting for trade activity...</p>
               ) : (
-                logs.map((log) => {
+                filteredLogs.map((log) => {
                   if (log.isDivider) {
                     return (
                       <div key={log.id} style={{ display: 'flex', alignItems: 'center', margin: '8px 0', opacity: 0.8 }}>
@@ -333,7 +533,7 @@ export default function App() {
                   }
 
                   const isPlayer = log.text.startsWith('Player:');
-                  const isBuy = log.text.includes('BOUGHT');
+                  const isBuy = log.text.includes('BOUGHT') || log.text.includes('BUY');
                   
                   let borderClr = isBuy ? '#22c55e' : '#ef4444';
                   let bgClr = isBuy ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)';
@@ -363,6 +563,7 @@ export default function App() {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px', textAlign: 'left', color: '#e2e8f0' }}>
             <thead>
               <tr style={{ color: '#64748b', borderBottom: '1px solid #1e293b', backgroundColor: '#0f172a' }}>
+                <th style={{ padding: '8px 12px' }}>TICKER</th>
                 <th style={{ padding: '8px 12px' }}>CONTRACT</th>
                 <th style={{ padding: '8px 12px' }}>QTY</th>
                 <th style={{ padding: '8px 12px' }}>ENTRY COST</th>
@@ -377,6 +578,7 @@ export default function App() {
                 const isProfit = pos.realizedPnl >= 0;
                 return (
                   <tr key={pos.id || idx} style={{ borderBottom: '1px solid #1e293b' }}>
+                    <td style={{ padding: '10px 12px', fontWeight: 'bold', color: '#38bdf8' }}>{pos.symbol || 'SPY'}</td>
                     <td style={{ padding: '10px 12px', fontWeight: 'bold' }}>
                       <span style={{ color: pos.type === 'CALL' ? '#22c55e' : '#ef4444', marginRight: '6px' }}>{pos.type}</span>
                       ${pos.strike} ({pos.expiration})
@@ -421,8 +623,9 @@ export default function App() {
       optionsChainContent={
         <OptionsChain
           isOpen={true}
+          symbol={selectedSymbol}
           currentPrice={currentPrice}
-          simulatedDate={simulatedDate} // Pass simulation date to options chain
+          simulatedDate={simulatedDate}
           onExecuteTrade={handleExecuteTrade}
         />
       }
@@ -465,7 +668,7 @@ export default function App() {
             <PositionsTable
               positions={openPositions}
               currentPrice={currentPrice}
-              simulatedDate={simulatedDate} // Pass simulation date to table
+              simulatedDate={simulatedDate}
               onClosePosition={handleClosePosition}
             />
           ) : (

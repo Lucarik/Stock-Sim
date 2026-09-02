@@ -1,7 +1,13 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-
 // --- Options Chain Component with DTE / Expiration Selector ---
-export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+
+export function OptionsChain({ 
+  symbol = 'SPY',             // <--- NEW: Dynamic symbol prop (defaults to SPY)
+  interval = '1d',            // <--- NEW: Dynamic interval prop (e.g., '5m', '15m', '1d')
+  currentPrice, 
+  simulatedDate, 
+  onExecuteTrade 
+}) {
   const [chain, setChain] = useState([]);
   const [selectedContract, setSelectedContract] = useState(null);
   const [contractsCount, setContractsCount] = useState(1);
@@ -18,8 +24,10 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
   const isInitialLoadRef = useRef(true);
   const activeFetchControllerRef = useRef(null);
 
-  // Normalize simulatedDate to YYYY-MM-DD string
+  // Normalize simulatedDate to string or ISO format for API query
+  // For intraday (5m ticks), we pass full ISO string or full date-time if available
   const simDay = simulatedDate ? String(simulatedDate).slice(0, 10) : '';
+  const simDateTime = simulatedDate ? new Date(simulatedDate).toISOString() : '';
 
   // Parse simulatedDate or fall back to system today
   const getSimulatedToday = useCallback(() => {
@@ -54,24 +62,31 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
   }, [getSimulatedToday]);
 
   // Build URL query param safely
-  const buildSimQuery = (paramName, dateStr) => {
-    if (!dateStr || typeof dateStr !== 'string' || dateStr.trim().length < 10) {
-      return '';
-    }
-    const cleanDate = dateStr.trim().slice(0, 10);
-    return `?${paramName}=${encodeURIComponent(cleanDate)}`;
+  const buildSimQuery = (dateStr) => {
+    if (!dateStr) return '';
+    return `&simulated_date=${encodeURIComponent(dateStr)}`;
   };
 
-  // 1. Fetch available Expiration Dates
+  // Reset selected contract if symbol or interval changes
+  useEffect(() => {
+    setSelectedContract(null);
+    userSelectedExpRef.current = '';
+    isInitialLoadRef.current = true;
+  }, [symbol, interval]);
+
+  // 1. Fetch available Expiration Dates for the specific symbol
   useEffect(() => {
     let isMounted = true;
     if (expirations.length === 0) {
       setLoading(true);
     }
 
-    const simParam = buildSimQuery('simulated_date', simDay);
+    const simQuery = buildSimQuery(simDay);
+    
+    // NEW: Appended ?symbol= & interval= parameters
+    const url = `http://localhost:8000/api/options-expirations?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}${simQuery}`;
 
-    fetch(`http://localhost:8000/api/options-expirations${simParam}`)
+    fetch(url)
       .then((res) => res.json())
       .then((dates) => {
         if (!isMounted) return;
@@ -117,10 +132,10 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
     return () => {
       isMounted = false;
     };
-  }, [simDay]);
+  }, [symbol, interval, simDay]); // Refetch expirations if symbol, interval, or date changes
 
-  // 2. Fetch Option Chain using simulatedDate
-  const fetchChain = useCallback((price, expDate, simDateStr, showLoader = false) => {
+  // 2. Fetch Option Chain using symbol, interval & simulatedDate
+  const fetchChain = useCallback((sym, tf, price, expDate, simDateStr, showLoader = false) => {
     if (price == null || isNaN(price) || !expDate) return;
 
     if (activeFetchControllerRef.current) {
@@ -133,8 +148,10 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
       setLoading(true);
     }
 
-    const simQuery = simDateStr ? `&simulated_date=${encodeURIComponent(simDateStr)}` : '';
-    const url = `http://localhost:8000/api/options-chain?current_price=${price}&expiration=${expDate}${simQuery}&_t=${Date.now()}`;
+    const simQuery = buildSimQuery(simDateStr);
+    
+    // NEW: Include symbol & interval in options-chain query
+    const url = `http://localhost:8000/api/options-chain?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(tf)}&current_price=${price}&expiration=${expDate}${simQuery}&_t=${Date.now()}`;
 
     fetch(url, { signal: controller.signal })
       .then((res) => res.json())
@@ -171,20 +188,25 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
   useEffect(() => {
     if (selectedExpiration) {
       const showLoader = isInitialLoadRef.current;
-      fetchChain(currentPrice, selectedExpiration, simDay, showLoader);
+      // For 5m interval, pass full simDateTime so the backend can evaluate intraday options pricing
+      const targetSimDate = interval === '5m' ? simDateTime : simDay;
+
+      fetchChain(symbol, interval, currentPrice, selectedExpiration, targetSimDate, showLoader);
 
       if (isInitialLoadRef.current) {
         isInitialLoadRef.current = false;
       }
     }
-  }, [currentPrice, selectedExpiration, simDay, fetchChain]);
+  }, [symbol, interval, currentPrice, selectedExpiration, simDay, simDateTime, fetchChain]);
 
   const handleExpirationChange = (e) => {
     const newExp = e.target.value;
     userSelectedExpRef.current = newExp;
     setSelectedExpiration(newExp);
     setSelectedContract(null);
-    fetchChain(currentPrice, newExp, simDay, true);
+
+    const targetSimDate = interval === '5m' ? simDateTime : simDay;
+    fetchChain(symbol, interval, currentPrice, newExp, targetSimDate, true);
   };
 
   const handleTrade = () => {
@@ -200,6 +222,7 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
 
     const askPrice = selectedContract.ask ?? 0;
     onExecuteTrade({
+      symbol,                    // <--- Included symbol in trade payload
       type: selectedContract.type,
       strike: selectedContract.strike,
       expiration: selectedExpiration,
@@ -244,6 +267,20 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <span
+            style={{
+              backgroundColor: '#38bdf8',
+              color: '#0f172a',
+              fontWeight: 'bold',
+              fontSize: '11px',
+              padding: '2px 6px',
+              borderRadius: '4px',
+              textTransform: 'uppercase',
+            }}
+          >
+            {symbol} ({interval})
+          </span>
+
           <label
             style={{
               fontSize: '12px',
@@ -316,11 +353,11 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
       >
         {loading ? (
           <div style={{ padding: '24px', textAlign: 'center', color: '#94a3b8' }}>
-            Loading Options Chain...
+            Loading {symbol} Options Chain...
           </div>
         ) : chain.length === 0 ? (
           <div style={{ padding: '24px', textAlign: 'center', color: '#ef4444' }}>
-            No options data returned for {selectedExpiration}. Check backend endpoint at
+            No options data returned for {symbol} ({selectedExpiration}). Check backend endpoint at
             http://localhost:8000/api/options-chain.
           </div>
         ) : (
@@ -524,7 +561,7 @@ export function OptionsChain({ currentPrice, simulatedDate, onExecuteTrade }) {
                 marginTop: '2px',
               }}
             >
-              Buy {contractsCount}x SPY ${selectedContract.strike} {selectedContract.type} (
+              Buy {contractsCount}x {symbol} ${selectedContract.strike} {selectedContract.type} (
               {selectedExpiration} • {currentDTE}d)
             </div>
             <div style={{ fontSize: '12px', color: '#64748b', marginTop: '2px' }}>
