@@ -23,11 +23,20 @@ const isIntradayDate = (dateStr) => {
 // Standardize date format for Lightweight Charts (supports both Intraday and Daily Unix Timestamps)
 const normalizeChartTime = (dateStr) => {
   if (!dateStr) return null;
-  const parsed = new Date(typeof dateStr === 'string' ? dateStr.replace(' ', 'T') : dateStr);
-  if (isNaN(parsed.getTime())) return null;
 
-  // Return Unix timestamp in seconds to handle both daily and intraday progression granularly
-  return Math.floor(parsed.getTime() / 1000);
+  // Handle "YYYY-MM-DD HH:MM:SS" (Intraday 5m format)
+  if (dateStr.includes(':')) {
+    const [datePart, timePart] = dateStr.split(' ');
+    const [year, month, day] = datePart.split('-').map(Number);
+    const [hours, minutes, seconds] = timePart.split(':').map(Number);
+
+    // Parse as UTC seconds to ensure consistent bucket math across timezones
+    return Math.floor(Date.UTC(year, month - 1, day, hours, minutes, seconds) / 1000);
+  }
+
+  // Handle "YYYY-MM-DD" (Daily format)
+  const [year, month, day] = dateStr.split('-').map(Number);
+  return Math.floor(Date.UTC(year, month - 1, day) / 1000);
 };
 
 const calculateSimDTE = (expirationStr, currentSimDateStr) => {
@@ -54,25 +63,33 @@ export default function App() {
   const seriesRef = useRef(null);
   const chartRef = useRef(null);
   const seriesTypeRef = useRef('line');
-  
+
   // Dynamic Stock Registry State
   const [availableSymbols, setAvailableSymbols] = useState(['SPY', 'QQQ']);
   const [selectedSymbol, setSelectedSymbol] = useState('SPY');
-  
+
+  // 1. New Timeframe Interval State (5m default)
+  const [selectedInterval, setSelectedInterval] = useState(5); // 5 or 15
+  const selectedIntervalRef = useRef(selectedInterval);
+  useEffect(() => {
+    selectedIntervalRef.current = selectedInterval;
+  }, [selectedInterval]);
+
   const selectedSymbolRef = useRef(selectedSymbol);
   useEffect(() => {
     selectedSymbolRef.current = selectedSymbol;
   }, [selectedSymbol]);
 
-  // Master historical buffers for dynamically registered symbols
+  // Master historical buffers (rawTicksMap stores raw time/price feeds for dynamic aggregation)
   const historyMapRef = useRef({});
+  const rawTicksMapRef = useRef({});
   const currentCandleMapRef = useRef({});
 
   // Dynamic Price & Date State Maps
   const [marketPrices, setMarketPrices] = useState({});
   const [priceChanges, setPriceChanges] = useState({});
   const [simulatedDates, setSimulatedDates] = useState({});
-  
+
   const [logs, setLogs] = useState([]);
   const [openPositions, setOpenPositions] = useState([]);
   const [closedPositions, setClosedPositions] = useState([]);
@@ -83,6 +100,71 @@ export default function App() {
   const currentPrice = marketPrices[selectedSymbol] || 0;
   const priceChange = priceChanges[selectedSymbol] || 0;
   const simulatedDate = simulatedDates[selectedSymbol] || '';
+
+  // Helper to re-aggregate raw tick data into 5m or 15m candles dynamically
+  const rebuildCandleHistory = (sym, intervalMinutes) => {
+    const ticks = rawTicksMapRef.current[sym] || [];
+    if (ticks.length === 0) return [];
+
+    const isDaily = intervalMinutes >= 1440; // 1 day = 1440 mins
+    const candleMap = new Map();
+
+    // 1. Group ticks into simulation timestamp buckets
+    ticks.forEach(({ time, price }) => {
+      let candleTime;
+
+      if (isDaily) {
+        // Bucket by UTC midnight for daily candles
+        const date = new Date(time * 1000);
+        candleTime = Math.floor(
+          Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()) / 1000
+        );
+      } else {
+        // Bucket by interval seconds (e.g. 5m = 300s, 15m = 900s)
+        const bucketInterval = intervalMinutes * 60;
+        candleTime = Math.floor(time / bucketInterval) * bucketInterval;
+      }
+
+      if (!candleMap.has(candleTime)) {
+        candleMap.set(candleTime, {
+          time: candleTime,
+          prices: [price],
+        });
+      } else {
+        candleMap.get(candleTime).prices.push(price);
+      }
+    });
+
+    // 2. Sort bucket keys chronologically
+    const sortedTimes = Array.from(candleMap.keys()).sort((a, b) => a - b);
+    const candles = [];
+    let prevClose = null;
+
+    // 3. Construct continuous candles
+    sortedTimes.forEach((candleTime) => {
+      const { prices } = candleMap.get(candleTime);
+      const firstPrice = prices[0];
+      const lastPrice = prices[prices.length - 1];
+
+      const openPrice = prevClose !== null ? prevClose : firstPrice;
+      const highPrice = Math.max(openPrice, ...prices);
+      const lowPrice = Math.min(openPrice, ...prices);
+
+      const candle = {
+        time: candleTime,
+        open: openPrice,
+        high: highPrice,
+        low: lowPrice,
+        close: lastPrice,
+      };
+
+      candles.push(candle);
+      prevClose = lastPrice;
+    });
+
+    currentCandleMapRef.current[sym] = candles[candles.length - 1] || null;
+    return candles;
+  };
 
   const handleExecuteTrade = (tradeData) => {
     const newPosition = {
@@ -192,7 +274,7 @@ export default function App() {
       try {
         const packet = JSON.parse(event.data);
 
-        // 1. Dynamic Registry Update (Dates & Symbol Registration)
+        // 1. Dynamic Registry Update
         if (packet.dates) {
           setSimulatedDates(packet.dates);
           const incomingSymbols = Object.keys(packet.dates);
@@ -213,75 +295,56 @@ export default function App() {
             return packet.data;
           });
 
-          // Continuous Background Data Access & Chart Buffering for ALL registered symbols
+          // Continuous Background Data Access & Chart Buffering
           Object.keys(packet.data).forEach((sym) => {
             const symPrice = packet.data[sym];
             const symDateStr = packet.dates?.[sym];
             if (symPrice === undefined || !symDateStr) return;
 
-            if (!historyMapRef.current[sym]) {
-              historyMapRef.current[sym] = [];
-            }
+            if (!historyMapRef.current[sym]) historyMapRef.current[sym] = [];
+            if (!rawTicksMapRef.current[sym]) rawTicksMapRef.current[sym] = [];
 
-            const timestampSec = normalizeChartTime(symDateStr);
+            const simDateStr = packet.dates[sym]; // e.g., "2026-08-26 09:30:00" or "2026-08-26"
+            const timestampSec = normalizeChartTime(simDateStr);
+
+            if (timestampSec !== null) {
+              // Push the SIMULATED time in seconds into your raw tick buffer
+              rawTicksMapRef.current[sym].push({ time: timestampSec, price: symPrice });
+            }
             if (!timestampSec) return;
 
-            const history = historyMapRef.current[sym];
-            const lastPoint = history[history.length - 1];
             const isIntraday = isIntradayDate(symDateStr);
+
+            // Inside ws.onmessage -> Object.keys(packet.data).forEach((sym) => { ...
 
             if (!isIntraday) {
               // Line Series Mode
+              const history = historyMapRef.current[sym] || [];
+              const lastPoint = history[history.length - 1];
               const newPoint = { time: timestampSec, value: symPrice };
 
               if (!lastPoint || lastPoint.time < timestampSec) {
                 history.push(newPoint);
-                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'line') {
-                  seriesRef.current.update(newPoint);
-                }
               } else if (lastPoint.time === timestampSec) {
                 history[history.length - 1] = newPoint;
-                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'line') {
-                  seriesRef.current.update(newPoint);
-                }
+              }
+              historyMapRef.current[sym] = history;
+
+              if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'line') {
+                seriesRef.current.update(newPoint);
               }
             } else {
-              // Candlestick Mode (5-min buckets)
-              const bucketInterval = 300; 
-              const candleTime = Math.floor(timestampSec / bucketInterval) * bucketInterval;
-              let activeCandle = currentCandleMapRef.current[sym];
+              // 1. Append raw tick to buffer
+              rawTicksMapRef.current[sym].push({ time: timestampSec, price: symPrice });
 
-              if (!activeCandle || candleTime > activeCandle.time) {
-                const prevClose = activeCandle ? activeCandle.close : symPrice;
-                const newCandle = {
-                  time: candleTime,
-                  open: prevClose,
-                  high: Math.max(prevClose, symPrice),
-                  low: Math.min(prevClose, symPrice),
-                  close: symPrice,
-                };
+              // 2. Re-aggregate for active symbol & interval to maintain exact continuous structure
+              if (selectedSymbolRef.current === sym) {
+                const updatedCandles = rebuildCandleHistory(sym, selectedIntervalRef.current);
+                historyMapRef.current[sym] = updatedCandles;
 
-                history.push(newCandle);
-                currentCandleMapRef.current[sym] = newCandle;
-
-                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'candlestick') {
-                  seriesRef.current.update(newCandle);
-                }
-              } else if (candleTime === activeCandle.time) {
-                const updatedCandle = {
-                  ...activeCandle,
-                  high: Math.max(activeCandle.high, symPrice),
-                  low: Math.min(activeCandle.low, symPrice),
-                  close: symPrice,
-                };
-
-                if (history.length > 0) {
-                  history[history.length - 1] = updatedCandle;
-                }
-                currentCandleMapRef.current[sym] = updatedCandle;
-
-                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'candlestick') {
-                  seriesRef.current.update(updatedCandle);
+                const activeCandle = updatedCandles[updatedCandles.length - 1];
+                if (seriesRef.current && seriesTypeRef.current === 'candlestick' && activeCandle) {
+                  seriesRef.current.update(activeCandle);
                 }
               }
             }
@@ -319,7 +382,7 @@ export default function App() {
     };
   }, []);
 
-  // Sync Chart Rendering dynamically on symbol selection or mode change
+  // Sync Chart Rendering dynamically on symbol selection, interval, or date mode change
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -357,6 +420,11 @@ export default function App() {
             lineWidth: 2,
           })
         : chart.addSeries(LineSeries, { color: '#26a69a', lineWidth: 2 });
+
+      const cachedHistory = historyMapRef.current[selectedSymbol] || [];
+      if (cachedHistory.length > 0) {
+        series.setData(cachedHistory);
+      }
     } else {
       seriesTypeRef.current = 'candlestick';
       series = typeof chart.addCandlestickSeries === 'function'
@@ -374,12 +442,13 @@ export default function App() {
             wickUpColor: '#26a69a',
             wickDownColor: '#ef5350',
           });
-    }
 
-    // Hydrate chart from dynamic history map buffer
-    const cachedHistory = historyMapRef.current[selectedSymbol] || [];
-    if (cachedHistory.length > 0) {
-      series.setData(cachedHistory);
+      // Hydrate dynamically using selected interval (5m vs 15m)
+      const candleHistory = rebuildCandleHistory(selectedSymbol, selectedInterval);
+      historyMapRef.current[selectedSymbol] = candleHistory;
+      if (candleHistory.length > 0) {
+        series.setData(candleHistory);
+      }
     }
 
     chartRef.current = chart;
@@ -398,13 +467,15 @@ export default function App() {
       chartRef.current = null;
       chart.remove();
     };
-  }, [selectedSymbol, isIntradayDate(simulatedDates[selectedSymbol])]);
+  }, [selectedSymbol, selectedInterval, isIntradayDate(simulatedDates[selectedSymbol])]);
 
   const activeNpc = npcStats[selectedSymbol] || { bull: {}, bear: {} };
 
   const filteredLogs = logs.filter(
     (log) => !log.symbol || log.symbol === selectedSymbol
   );
+
+  const isIntradayActive = isIntradayDate(simulatedDates[selectedSymbol] || '');
 
   const dashboardView = (
     <>
@@ -443,7 +514,7 @@ export default function App() {
             ))}
           </select>
         </div>
-        
+
         {currentPrice !== 0 && (
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: '12px', color: '#38bdf8', fontWeight: 'bold' }}>
@@ -461,10 +532,50 @@ export default function App() {
 
       <div style={{ display: 'grid', gridTemplateColumns: '3fr 1fr', gap: '24px' }}>
         <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '16px', border: '1px solid #1e293b' }}>
-          <h2 style={{ fontSize: '16px', margin: '0 0 12px 0', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
-            {selectedSymbol} Real-Time Stream
-          </h2>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <h2 style={{ fontSize: '16px', margin: 0, color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+              {selectedSymbol} Real-Time Stream {isIntradayActive && `(${selectedInterval}m)`}
+            </h2>
+
+            {/* Interval Selector Controls (Visible only on Intraday Candlestick charts) */}
+            {isIntradayActive && (
+              <div style={{ display: 'flex', gap: '4px', backgroundColor: '#0f172a', padding: '2px', borderRadius: '6px', border: '1px solid #1e293b' }}>
+                <button
+                  onClick={() => setSelectedInterval(5)}
+                  style={{
+                    padding: '4px 10px',
+                    borderRadius: '4px',
+                    border: 'none',
+                    backgroundColor: selectedInterval === 5 ? '#38bdf8' : 'transparent',
+                    color: selectedInterval === 5 ? '#0f172a' : '#94a3b8',
+                    fontWeight: 'bold',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  5m
+                </button>
+                <button
+                  onClick={() => setSelectedInterval(15)}
+                  style={{
+                    padding: '4px 10px',
+                    borderRadius: '4px',
+                    border: 'none',
+                    backgroundColor: selectedInterval === 15 ? '#38bdf8' : 'transparent',
+                    color: selectedInterval === 15 ? '#0f172a' : '#94a3b8',
+                    fontWeight: 'bold',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  15m
+                </button>
+              </div>
+            )}
+          </div>
           <div ref={chartContainerRef} style={{ width: '100%' }} />
         </div>
 
@@ -501,7 +612,7 @@ export default function App() {
                 filteredLogs.map((log) => {
                   const isPlayer = log.text.startsWith('Player:');
                   const isBuy = log.text.includes('BOUGHT') || log.text.includes('BUY');
-                  
+
                   let borderClr = isBuy ? '#22c55e' : '#ef4444';
                   let bgClr = isBuy ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)';
                   if (isPlayer) { borderClr = '#38bdf8'; bgClr = 'rgba(56, 189, 248, 0.1)'; }

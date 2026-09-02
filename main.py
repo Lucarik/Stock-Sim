@@ -10,23 +10,18 @@ import zoneinfo
 from pathlib import Path
 from typing import Optional, Union, Dict, List, Any
 import inspect
-import collections
-
-import gymnasium as gym
 import numpy as np
 import pandas as pd
 import torch
-import yfinance as yf
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from gymnasium import spaces
-from pydantic import BaseModel
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
+from scipy.stats import norm
 
-from helpers import SPYOptionsEnvCalls, SPYOptionsEnvPuts, SPYOptionsEnv5m, prepare_spy_5m_data
+from helpers import SPYOptionsEnvCalls, SPYOptionsEnvPuts, SPYOptionsEnv5m, SPYStockSimulator, QQQ5mStockSimulator, HistoricalCSVStockSimulator, prepare_spy_5m_data
 
 # Import your simulator and custom options environment
 #from simulator import SPYStockSimulator  # Adjust import path if needed
@@ -44,43 +39,66 @@ app.add_middleware(
 )
 
 # --- Black-Scholes Helper ---
-def black_scholes_call(S, K, T, r=0.05, sigma=0.18):
-    """Calculates theoretical Call premium per share."""
-    if T <= 0:
-        return max(0.0, S - K)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    # Standard normal CDF approximation
-    def norm_cdf(x):
-        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-    return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
+def compute_black_scholes_side(
+    spot: float,
+    strike: float,
+    dte: float,
+    is_call: bool,
+    iv_rank: float = 0.35
+) -> tuple[float, float]:
+    """Calculates Black-Scholes bid and ask for a specific option side."""
+    # 1. Effective Time to Expiration in Years
+    T = max(1e-6, float(dte) / 365.0)
+    
+    # 2. Implied Volatility & Skew
+    iv_rank = float(np.clip(iv_rank, 0.0, 1.0))
+    sigma = 0.10 + (iv_rank * 0.35)
+    
+    # Volatility Skew Adjustment (Put Skew for OTM Puts)
+    moneyness_ratio = strike / max(0.01, spot)
+    if not is_call and moneyness_ratio < 1.0:
+        sigma *= 1.0 + (1.0 - moneyness_ratio) * 0.8
+        
+    r = 0.04  # Risk-free rate (4%)
 
-def black_scholes_put(S, K, T, r=0.05, sigma=0.18):
-    """Calculates theoretical Put premium per share."""
-    call = black_scholes_call(S, K, T, r, sigma)
-    return call + K * math.exp(-r * T) - S
+    # 3. Black-Scholes d1 & d2
+    d1 = (np.log(spot / strike) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
 
-def compute_option_row(spot: float, strike: float, dte: int = 7, iv: float = 0.20):
+    # 4. Mid Price & Delta
+    if is_call:
+        mid_price = spot * norm.cdf(d1) - strike * np.exp(-r * T) * norm.cdf(d2)
+        delta = norm.cdf(d1)
+    else:
+        mid_price = strike * np.exp(-r * T) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+        delta = abs(norm.cdf(d1) - 1.0)
+
+    mid_price = max(0.01, float(mid_price))
+
+    # 5. Market Maker Bid/Ask Spread
+    otm_penalty = (1.0 - delta) * 0.02
+    iv_penalty = iv_rank * 0.02
+    half_spread = max(0.005, 0.005 + otm_penalty + iv_penalty)
+
+    bid = max(0.01, round(mid_price - half_spread, 2))
+    ask = max(0.02, round(mid_price + half_spread, 2))
+
+    return bid, ask
+
+
+def compute_option_row(
+    spot: float,
+    strike: float,
+    dte: float = 7.0,
+    iv_rank: float = 0.35
+) -> Dict[str, Any]:
     """
-    Recalculates Option Premiums dynamically on every tick based on spot and DTE.
+    Recalculates Option Premiums using Black-Scholes while maintaining
+    100% backward compatibility with the expected frontend key schema.
     """
-    call_intrinsic = max(0.0, spot - strike)
-    put_intrinsic = max(0.0, strike - spot)
-    
-    # Simple Black-Scholes extrinsic/time value approximation
-    # Avoid zero division when dte is 0DTE
-    t = max(dte, 0.5) / 365.0
-    time_value = spot * iv * math.sqrt(t) * 0.4 * math.exp(-((spot - strike) / (spot * 0.05)) ** 2)
-    
-    call_mid = call_intrinsic + time_value
-    put_mid = put_intrinsic + time_value
-    
-    spread = 0.10
-    call_bid = max(0.01, round(call_mid - (spread / 2), 2))
-    call_ask = max(0.02, round(call_mid + (spread / 2), 2))
-    put_bid = max(0.01, round(put_mid - (spread / 2), 2))
-    put_ask = max(0.02, round(put_mid + (spread / 2), 2))
-    
+    call_bid, call_ask = compute_black_scholes_side(spot, strike, dte, is_call=True, iv_rank=iv_rank)
+    put_bid, put_ask = compute_black_scholes_side(spot, strike, dte, is_call=False, iv_rank=iv_rank)
+
     return {
         "strike": strike,
         "call_bid": call_bid,
@@ -90,644 +108,6 @@ def compute_option_row(spot: float, strike: float, dte: int = 7, iv: float = 0.2
         "in_the_money_call": spot > strike,
         "in_the_money_put": spot < strike,
     }
-
-def parse_sim_date(
-    date_val: Optional[Union[str, date, datetime]]
-) -> date:
-    """Helper to reliably parse simulation dates into datetime.date objects."""
-    # 1. Clean up string input (handle empty string, "null", "undefined", etc.)
-    if isinstance(date_val, str):
-        date_val = date_val.strip()
-        if not date_val or date_val.lower() in ("none", "null", "undefined"):
-            date_val = None
-
-    # 2. Guard for None
-    if date_val is None:
-        # Changed warning -> info/debug so expected default route behavior doesn't trigger console warnings
-        logging.info("parse_sim_date received None or empty value. Defaulting to system date.today().")
-        return date.today()
-
-    if isinstance(date_val, datetime):
-        return date_val.date()
-    if isinstance(date_val, date):
-        return date_val
-
-    try:
-        return datetime.fromisoformat(str(date_val).replace("Z", "")).date()
-    except ValueError:
-        try:
-            return datetime.strptime(str(date_val)[:10], "%Y-%m-%d").date()
-        except ValueError:
-            # Keep warning here because an unparseable string IS an actual error!
-            logging.warning(f"parse_sim_date failed to parse '{date_val}'. Defaulting to date.today().")
-            return date.today()
-
-
-def calculate_dte_from_expiration(
-    expiration_str: Optional[str], 
-    current_sim_date: Optional[Union[str, date, datetime]] = None
-) -> int:
-    """
-    Calculates Days To Expiration (DTE) relative to the simulator's current date.
-    """
-    if not expiration_str:
-        return 7  # Fallback default
-    
-    try:
-        exp_date = datetime.strptime(expiration_str[:10], "%Y-%m-%d").date()
-        sim_today = parse_sim_date(current_sim_date)
-        
-        days_diff = (exp_date - sim_today).days
-        return max(0, days_diff)  # Ensure non-negative DTE
-    except ValueError:
-        return 7
-
-from datetime import datetime, timedelta
-import numpy as np
-
-
-class SPYStockSimulator:
-    def __init__(
-        self,
-        initial_price=100.0,
-        annual_drift=0.08,
-        base_volatility=0.16,
-        start_dt=None,
-    ):
-        """Emulates daily SPY price dynamics with mean-reverting drift,
-
-        volatility clustering, and tail-risk jumps.
-        """
-        self.initial_price = initial_price
-        self.mu_base = annual_drift
-        self.sigma_base = base_volatility
-        self.start_dt = (
-            start_dt
-            if start_dt is not None
-            else datetime.now().replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-        )
-
-        # 1 trading day step
-        self.dt = 1.0 / 252.0
-
-        # Volatility clustering memory (GARCH-like persistence)
-        self.vol_persistence = 0.92
-
-        # Jump Diffusion Parameters (Simulating sudden drops/rallies)
-        self.jump_prob = 0.05  # 5% chance of a jump event on any given day
-        self.jump_mean = -0.005  # Slight negative bias on jumps
-        self.jump_std = 0.025  # Magnitude of news shocks
-
-        # Initialize dynamic state variables
-        self.reset()
-
-    def reset(self, new_initial_price=None, start_dt=None):
-        """Resets simulator state (price, datetime, and volatility) back to initial values.
-
-        Optionally allows updating the initial price anchor or start datetime.
-        """
-        if new_initial_price is not None:
-            self.initial_price = float(new_initial_price)
-
-        if start_dt is not None:
-            self.start_dt = start_dt
-
-        self.price = self.initial_price
-        self.current_sigma = self.sigma_base
-        self.current_dt = self.start_dt
-        return self.price
-
-    def step_day(self):
-        """Advances the simulator by 1 trading day and advances current_dt past weekends."""
-        # 1. Advance DateTime State (Skip weekends)
-        self.current_dt += timedelta(days=1)
-        while self.current_dt.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
-            self.current_dt += timedelta(days=1)
-
-        # 2. Update Volatility Clustering (stochastic volatility)
-        vol_shock = np.random.normal(0, 1)
-        self.current_sigma = max(
-            0.08,
-            self.vol_persistence * self.current_sigma
-            + (1 - self.vol_persistence) * self.sigma_base
-            + 0.02 * abs(vol_shock),
-        )
-
-        # 3. Mean-Reverting Drift Adjustment
-        deviation_from_base = (
-            self.price - self.initial_price
-        ) / self.initial_price
-        trend_pull = -0.05 * deviation_from_base
-        effective_mu = self.mu_base + trend_pull
-
-        # 4. Standard GBM Diffusion
-        epsilon = np.random.normal(0, 1)
-        drift = (effective_mu - 0.5 * (self.current_sigma**2)) * self.dt
-        diffusion = self.current_sigma * np.sqrt(self.dt) * epsilon
-
-        # 5. Jump Shock Process (Poisson Jump Diffusion)
-        jump = 0.0
-        if np.random.rand() < self.jump_prob:
-            jump = np.random.normal(self.jump_mean, self.jump_std)
-
-        # 6. Calculate New Price
-        daily_return = np.exp(drift + diffusion + jump)
-        self.price = max(0.01, self.price * daily_return)
-
-        return round(self.price, 2)
-
-    def generate_bars(self, num_days=252):
-        """Convenience method to generate a full array of daily closing prices."""
-        prices = [self.price]
-        for _ in range(num_days):
-            prices.append(self.step_day())
-        return np.array(prices)
-
-class QQQ5mStockSimulator:
-    """Simulates realistic 5-minute SPY/QQQ intraday bar data with regime-dependent jump shocks.
-
-    Features:
-    - Dynamic Regime Jumps: Jump probability and severity expand during high-volatility regimes.
-    - Intraday U-shaped volatility & volume profile.
-    - GARCH-like stochastic volatility clustering.
-    - Full Timestamp Tracking: Tracks current datetime (`current_dt`) across trading days.
-    - Complete ML Feature Alignment: Fully outputs sin_time, cos_time, sma_ratio, rsi, z_ret_1bar,
-      z_ret_6bar, and vol_expansion_ratio via prepare_spy_5m_data integration.
-    """
-
-    def __init__(
-        self,
-        initial_price: float = 500.0,
-        annual_drift: float = 0.08,
-        base_volatility: float = 0.16,
-        average_daily_volume: int = 50_000_000,
-        base_jump_prob: float = 0.0005,
-        max_history: int = 300,
-        start_dt: datetime | None = None,
-    ):
-        self.initial_price = float(initial_price)
-        self.max_history = max_history
-
-        # Time step parameters: 252 trading days * 78 five-minute bars = 19,656 bars/year
-        self.bars_per_day = 78
-        self.dt = 1.0 / (252.0 * self.bars_per_day)
-
-        # Drift and Volatility (annualized base)
-        self.mu_base = annual_drift
-        self.sigma_base = base_volatility
-
-        # Volatility persistence per 5m step
-        self.vol_persistence = 0.998
-
-        # Volume parameters
-        self.avg_daily_vol = average_daily_volume
-        self.avg_bar_vol = self.avg_daily_vol / self.bars_per_day
-
-        # Baseline Jump Parameters
-        self.base_jump_prob = base_jump_prob
-        self.base_jump_mean = -0.002
-        self.base_jump_std = 0.008
-
-        # Datetime tracking state
-        self._start_dt = start_dt or datetime.now().replace(
-            hour=9, minute=30, second=0, microsecond=0
-        )
-
-        # Initialize environment state via reset
-        self.reset()
-
-    @property
-    def current_dt(self) -> datetime:
-        """Returns the current 5-minute bar timestamp."""
-        return self._current_dt
-
-    def _advance_to_next_bar_dt(self):
-        """Advances internal timestamp by 5 minutes, handling market closing transitions."""
-        next_dt = self._current_dt + timedelta(minutes=5)
-        # Market closes at 16:00 (4:00 PM EST)
-        if next_dt.time() >= time(16, 0):
-            # Advance to 9:30 AM on the next business day
-            next_date = next_dt.date() + timedelta(days=1)
-            while next_date.weekday() >= 5:  # Skip weekends
-                next_date += timedelta(days=1)
-            self._current_dt = datetime.combine(next_date, time(9, 30))
-        else:
-            self._current_dt = next_dt
-
-    def reset(
-        self,
-        initial_price: float | None = None,
-        start_dt: datetime | None = None,
-    ) -> dict[str, float]:
-        """Resets all simulation state tracking variables for a new episode."""
-        if initial_price is not None:
-            self.initial_price = float(initial_price)
-
-        if start_dt is not None:
-            self._start_dt = start_dt
-
-        self._price = self.initial_price
-        self.current_sigma = self.sigma_base
-        self.bar_index_in_day = 0
-        self._current_dt = self._start_dt
-
-        # Feature state tracking containers (buffers)
-        self.closes = collections.deque(
-            [self._price] * 50, maxlen=self.max_history
-        )
-        self.highs = collections.deque(
-            [self._price] * 50, maxlen=self.max_history
-        )
-        self.lows = collections.deque(
-            [self._price] * 50, maxlen=self.max_history
-        )
-        self.cum_pv = self._price * 1000.0
-        self.cum_vol = 1000.0
-
-        return {
-            "price": self._price,
-            "timestamp": self._current_dt,
-            "vwap_dist": 0.0,
-            "iv_rank": 0.5,
-            "rsi": 50.0,
-            "sma_ratio": 0.0,
-            "z_ret_1bar": 0.0,
-            "z_ret_6bar": 0.0,
-            "vol_expansion_ratio": 0.0,
-            "sin_time": 0.0,
-            "cos_time": 1.0,
-        }
-
-    @property
-    def price(self) -> float:
-        return self._price
-
-    @price.setter
-    def price(self, val: float):
-        self._price = float(val)
-
-    def _get_intraday_multipliers(
-        self, step_in_day: int
-    ) -> tuple[float, float]:
-        x = step_in_day / (self.bars_per_day - 1)
-        vol_mult = 1.8 - 2.8 * x + 2.8 * (x**2)
-        volu_mult = 2.5 - 4.2 * x + 4.2 * (x**2)
-        return max(0.4, vol_mult), max(0.2, volu_mult)
-
-    def _compute_regime_jump_parameters(self) -> tuple[float, float, float]:
-        vol_ratio = self.current_sigma / self.sigma_base
-        effective_jump_prob = min(0.02, self.base_jump_prob * (vol_ratio**2))
-        effective_jump_mean = self.base_jump_mean * (vol_ratio**1.3)
-        effective_jump_std = self.base_jump_std * vol_ratio
-        return effective_jump_prob, effective_jump_mean, effective_jump_std
-
-    def _calculate_features(
-        self, price: float, high: float, low: float, volume: float
-    ) -> dict[str, float]:
-        """Calculates running technical features bar-by-bar for real-time simulation."""
-        self.closes.append(price)
-        self.highs.append(high)
-        self.lows.append(low)
-
-        # 1. VWAP Distance
-        typical_price = (high + low + price) / 3.0
-        self.cum_pv += typical_price * volume
-        self.cum_vol += volume
-        current_vwap = (
-            self.cum_pv / self.cum_vol if self.cum_vol > 0 else price
-        )
-        vwap_dist = float(
-            np.clip((price - current_vwap) / current_vwap, -0.03, 0.03)
-        )
-
-        # Convert buffers to arrays for indicator calculations
-        closes_arr = np.array(self.closes, dtype=np.float32)
-        highs_arr = np.array(self.highs, dtype=np.float32)
-        lows_arr = np.array(self.lows, dtype=np.float32)
-
-        # 2. Parkinson Volatility Proxy & IV Rank
-        ratio = np.maximum(highs_arr / np.maximum(lows_arr, 1e-5), 1.0)
-        log_hl = np.log(ratio) ** 2
-        parkinson_vol = np.sqrt(
-            (1.0 / (4.0 * np.log(2.0) * len(highs_arr))) * np.sum(log_hl)
-        )
-        iv_rank = float(np.clip((parkinson_vol - 0.005) / 0.025, 0.0, 1.0))
-
-        # 3. Dynamic RSI (14-period)
-        deltas = np.diff(closes_arr[-15:])
-        gains = np.maximum(deltas, 0.0)
-        losses = -np.minimum(deltas, 0.0)
-        avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
-        avg_loss = np.mean(losses) if len(losses) > 0 else 0.0
-        rs = avg_gain / max(1e-8, avg_loss)
-        rsi = float(np.clip(100.0 - (100.0 / (1.0 + rs)), 0.0, 100.0))
-
-        # 4. Moving Average Ratios (12-bar vs 48-bar)
-        sma_12 = np.mean(closes_arr[-12:])
-        sma_48 = np.mean(closes_arr[-48:]) if len(closes_arr) >= 48 else sma_12
-        sma_ratio = float(
-            np.clip((sma_12 - sma_48) / max(1e-5, sma_48), -0.05, 0.05)
-        )
-
-        # 5. Returns & Multi-Bar Z-Scores
-        ret_1m = np.log(closes_arr[-1] / closes_arr[-2])
-        recent_rets = np.diff(np.log(closes_arr[-21:]))
-        rolling_std = (
-            np.std(recent_rets) if len(recent_rets) > 0 else 0.001
-        ) + 1e-8
-
-        z_ret_1bar = float(
-            np.clip(
-                (ret_1m - np.mean(recent_rets)) / rolling_std, -3.0, 3.0
-            )
-        )
-
-        ret_6bar = np.log(closes_arr[-1] / closes_arr[-7])
-        z_ret_6bar = float(
-            np.clip(ret_6bar / (rolling_std * np.sqrt(6)), -3.0, 3.0)
-        )
-
-        # 6. Volatility Expansion Ratio (6-bar std / 48-bar std)
-        vol_6 = np.std(recent_rets[-6:]) if len(recent_rets) >= 6 else 0.001
-        vol_48 = np.std(recent_rets) if len(recent_rets) >= 20 else 0.001
-        vol_expansion_ratio = float(
-            np.clip(np.log(max(1e-5, vol_6) / max(1e-5, vol_48)), -1.5, 1.5)
-        )
-
-        # 7. Cyclical Time Encodings
-        norm_time = float(self.bar_index_in_day / 78.0)
-        sin_time = float(np.sin(2 * np.pi * norm_time))
-        cos_time = float(np.cos(2 * np.pi * norm_time))
-
-        return {
-            "vwap_dist": vwap_dist,
-            "iv_rank": iv_rank,
-            "rsi": rsi,
-            "sma_ratio": sma_ratio,
-            "z_ret_1bar": z_ret_1bar,
-            "z_ret_6bar": z_ret_6bar,
-            "vol_expansion_ratio": vol_expansion_ratio,
-            "sin_time": sin_time,
-            "cos_time": cos_time,
-        }
-
-    def step_bar(self) -> dict[str, float]:
-        """Advances the simulator by 1 five-minute bar and returns metrics."""
-        if self.bar_index_in_day == 0:
-            self.cum_pv = 0.0
-            self.cum_vol = 0.0
-
-        vol_mult, volu_mult = self._get_intraday_multipliers(
-            self.bar_index_in_day
-        )
-
-        # Volatility Clustering & Shock
-        vol_shock = np.random.normal(0, 1)
-        effective_sigma_base = self.sigma_base * vol_mult
-        self.current_sigma = max(
-            0.04,
-            self.vol_persistence * self.current_sigma
-            + (1.0 - self.vol_persistence) * effective_sigma_base
-            + 0.0035 * abs(vol_shock),
-        )
-
-        jump_prob, jump_mean, jump_std = (
-            self._compute_regime_jump_parameters()
-        )
-
-        # Drift & Price Calculations
-        deviation_from_base = (
-            self._price - self.initial_price
-        ) / self.initial_price
-        trend_pull = -0.05 * deviation_from_base
-        effective_mu = self.mu_base + trend_pull
-
-        epsilon = np.random.normal(0, 1)
-        drift = (effective_mu - 0.5 * (self.current_sigma**2)) * self.dt
-        diffusion = self.current_sigma * np.sqrt(self.dt) * epsilon
-
-        jump = 0.0
-        if np.random.rand() < jump_prob:
-            jump = np.random.normal(jump_mean, jump_std)
-            self.current_sigma += abs(jump) * 2.0
-
-        open_price = self._price
-        bar_return = np.exp(drift + diffusion + jump)
-        close_price = max(0.01, open_price * bar_return)
-
-        bar_sigma = self.current_sigma * np.sqrt(self.dt)
-        high_price = max(open_price, close_price) * (
-            1.0 + abs(np.random.normal(0, bar_sigma * 0.6))
-        )
-        low_price = min(open_price, close_price) * (
-            1.0 - abs(np.random.normal(0, bar_sigma * 0.6))
-        )
-
-        # Volume Synthesis
-        price_change_pct = abs(close_price - open_price) / open_price
-        bar_volume = float(
-            max(
-                100,
-                int(
-                    self.avg_bar_vol
-                    * volu_mult
-                    * (1.0 + 60.0 * price_change_pct)
-                    * np.random.lognormal(mean=0, sigma=0.25)
-                ),
-            )
-        )
-
-        self._price = float(close_price)
-
-        # Compute Technical Features
-        features = self._calculate_features(
-            close_price, high_price, low_price, bar_volume
-        )
-
-        # Output current bar metrics before incrementing time cursor
-        output = {
-            "timestamp": self._current_dt,
-            "open": round(open_price, 2),
-            "high": round(high_price, 2),
-            "low": round(low_price, 2),
-            "close": round(close_price, 2),
-            "volume": bar_volume,
-        }
-        output.update(features)
-
-        # Advance internal intraday bar index and timestamp cursor
-        self.bar_index_in_day = (
-            self.bar_index_in_day + 1
-        ) % self.bars_per_day
-        self._advance_to_next_bar_dt()
-
-        return output
-
-    def step_5m(self) -> dict[str, float]:
-        """Explicit alias for StockContext 5-minute interval stepping."""
-        return self.step_bar()
-
-    def generate_5m_dataframe(
-        self,
-        num_days: int = 60,
-        start_date: datetime | None = None,
-        prepare_features: bool = True,
-    ) -> pd.DataFrame:
-        """Generates a multi-day 5-minute DataFrame and pipelines it through prepare_spy_5m_data."""
-        if start_date is None:
-            start_date = datetime.now() - timedelta(days=int(num_days * 1.5))
-
-        records = []
-        current_curr_date = start_date.date()
-        days_created = 0
-
-        while days_created < num_days:
-            if current_curr_date.weekday() >= 5:
-                current_curr_date += timedelta(days=1)
-                continue
-
-            market_open_dt = datetime.combine(current_curr_date, time(9, 30))
-            self.bar_index_in_day = 0
-            self._current_dt = market_open_dt
-
-            for i in range(self.bars_per_day):
-                bar_data = self.step_bar()
-                records.append(bar_data)
-
-            days_created += 1
-            current_curr_date += timedelta(days=1)
-
-        raw_df = pd.DataFrame(records)
-
-        # Run vectorized feature pipeline across dataset if requested
-        if prepare_features:
-            return prepare_spy_5m_data(raw_df)
-
-        return raw_df
-
-class HistoricalCSVStockSimulator:
-    """Replays historical 5-minute CSV data sequentially as a drop-in simulator.
-
-    Interface compatible with StockContext, QQQ5mStockSimulator, and SPY
-    environments.
-    """
-
-    def __init__(
-        self,
-        csv_path_or_df: Union[str, Path, pd.DataFrame],
-        loop: bool = True,
-        auto_prepare: bool = True,
-    ):
-        """Args:
-
-        csv_path_or_df: File path to spy_5m_polygon_prepared.csv or DataFrame.
-        loop: If True, wraps back to row 0 when reaching the end of dataset.
-        auto_prepare: Executes prepare_spy_5m_data if required features missing.
-        """
-        if isinstance(csv_path_or_df, (str, Path)):
-            self.df = pd.read_csv(csv_path_or_df)
-        else:
-            self.df = csv_path_or_df.copy()
-
-        # Run feature preparation pipeline if essential features are missing
-        required_cols = {"close", "vwap_dist", "iv_rank", "timestamp"}
-        if auto_prepare and not required_cols.issubset(set(self.df.columns)):
-            from helpers import (  # Import your pipeline function
-                prepare_spy_5m_data,
-            )
-
-            self.df = prepare_spy_5m_data(self.df)
-
-        # Parse timestamps and sort chronologically
-        if "timestamp" in self.df.columns:
-            self.df["timestamp"] = pd.to_datetime(self.df["timestamp"])
-            self.df = self.df.sort_values("timestamp").reset_index(drop=True)
-
-        self.loop = loop
-        self.current_idx = 0
-        self.max_idx = len(self.df)
-
-        if self.max_idx == 0:
-            raise ValueError("CSV data contains no valid rows.")
-
-    @property
-    def _safe_idx(self) -> int:
-        """Helper to clamp pointer within bounds to prevent IndexError."""
-        return min(self.current_idx, self.max_idx - 1)
-
-    @property
-    def price(self) -> float:
-        """Exposes current close price for StockContext inspection."""
-        row = self.df.iloc[self._safe_idx]
-        return float(row.get("close", row.get("price", 100.0)))
-
-    @price.setter
-    def price(self, val: float):
-        """Allows price updates for StockContext alignment."""
-        pass
-
-    @property
-    def current_dt(self) -> Optional[datetime]:
-        """Exposes current timestamp from the historical dataset."""
-        if "timestamp" in self.df.columns:
-            ts = self.df.iloc[self._safe_idx]["timestamp"]
-            return ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
-        return None
-
-    def _extract_bar_dict(self, row: pd.Series) -> Dict[str, Any]:
-        """Helper to standardize feature names and types across reset and step."""
-        ts = row.get("timestamp", None)
-        if hasattr(ts, "to_pydatetime"):
-            ts = ts.to_pydatetime()
-
-        return {
-            "price": float(row.get("close", 0.0)),
-            "open": float(row.get("open", row.get("close", 0.0))),
-            "high": float(row.get("high", row.get("close", 0.0))),
-            "low": float(row.get("low", row.get("close", 0.0))),
-            "close": float(row.get("close", 0.0)),
-            "volume": float(row.get("volume", 1000.0)),
-            "sin_time": float(row.get("sin_time", 0.0)),
-            "cos_time": float(row.get("cos_time", 1.0)),
-            "sma_ratio": float(row.get("sma_ratio", 0.0)),
-            "rsi": float(row.get("rsi", 50.0)),
-            "vwap_dist": float(row.get("vwap_dist", 0.0)),
-            "iv_rank": float(row.get("iv_rank", 0.35)),
-            "z_ret_1bar": float(row.get("z_ret_1bar", 0.0)),
-            "z_ret_6bar": float(row.get("z_ret_6bar", 0.0)),
-            "vol_expansion_ratio": float(
-                row.get("vol_expansion_ratio", row.get("vol_expansion", 0.0))
-            ),
-            "timestamp": ts,
-        }
-
-    def step_bar(self) -> Dict[str, Any]:
-        """Advances 1 bar forward in historical data and returns the record."""
-        row = self.df.iloc[self._safe_idx]
-        bar_dict = self._extract_bar_dict(row)
-
-        # Advance pointer
-        self.current_idx += 1
-        if self.current_idx >= self.max_idx:
-            if self.loop:
-                self.current_idx = 0
-            else:
-                self.current_idx = self.max_idx - 1
-
-        return bar_dict
-
-    def step_5m(self) -> Dict[str, Any]:
-        """Explicit alias for StockContext 5m stepping."""
-        return self.step_bar()
-
-    def reset(self, start_idx: int = 0) -> Dict[str, Any]:
-        """Resets replay pointer back to start_idx and returns initial observation dict."""
-        self.current_idx = min(max(0, start_idx), self.max_idx - 1)
-        row = self.df.iloc[self._safe_idx]
-        return self._extract_bar_dict(row)
-
 
 # Daily Stock Simulator (SPY)
 #spy_sim = SPYStockSimulator(initial_price=450.0, annual_drift=0.09, base_volatility=0.18)
@@ -782,6 +162,24 @@ def parse_sim_date(
             logging.warning(f"parse_sim_date failed to parse '{date_val}'. Defaulting to date.today().")
             return date.today()
 
+def calculate_dte_from_expiration(
+    expiration_str: Optional[str], 
+    current_sim_date: Optional[Union[str, date, datetime]] = None
+) -> int:
+    """
+    Calculates Days To Expiration (DTE) relative to the simulator's current date.
+    """
+    if not expiration_str:
+        return 7  # Fallback default
+    
+    try:
+        exp_date = datetime.strptime(expiration_str[:10], "%Y-%m-%d").date()
+        sim_today = parse_sim_date(current_sim_date)
+        
+        days_diff = (exp_date - sim_today).days
+        return max(0, days_diff)  # Ensure non-negative DTE
+    except ValueError:
+        return 7
 
 def step_5m(current_dt: datetime) -> datetime:
     """Advances time by 5 minutes, skipping non-trading hours and weekends."""
@@ -1296,7 +694,7 @@ STOCKS: Dict[str, StockContext] = {
         bull_env_cls=SPYOptionsEnv5m,
         bear_env_cls=SPYOptionsEnv5m,
         bull_model_file="best_model11p(120).zip",
-        bear_model_file="best_model11p(120).zip",
+        bear_model_file="best_model10p(90).zip",
     ),
     "SPO": build_stock_context(
         symbol="SPO",
@@ -1305,7 +703,7 @@ STOCKS: Dict[str, StockContext] = {
         bull_env_cls=SPYOptionsEnv5m,
         bear_env_cls=SPYOptionsEnv5m,
         bull_model_file="best_model11p(120).zip",
-        bear_model_file="best_model11p(120).zip",
+        bear_model_file="best_model10p(90).zip",
     )
 }
 
@@ -1367,10 +765,10 @@ def step_agent(
     else:
         norm_obs = obs_batch
 
-    if isinstance(npc, MaskablePPO):
-        row = base_env.df.iloc[base_env.data_idx]
-        #print("vwap_dist: ", float(row.get("vwap_dist", 0.0)))
-        #print("cash: ", base_env.cash, "timestamp: ", row.get("timestamp", None))
+    # if isinstance(npc, MaskablePPO):
+    #     row = base_env.df.iloc[base_env.data_idx]
+    #     print("vwap_dist: ", float(row.get("vwap_dist", 0.0)), "iv_rank: ", float(row.get("iv_rank", 0.0)))
+    #      print("cash: ", base_env.cash, "timestamp: ", row.get("timestamp", None))
 
     # 3. Predict Action
     if isinstance(npc, MaskablePPO):
@@ -1406,7 +804,6 @@ def step_agent(
 
     # 7. Soft reset on done
     if done:
-        print("done")
         if hasattr(base_env, "close_position") and getattr(base_env, "contracts", 0) > 0:
             try:
                 base_env.close_position(current_price)
@@ -1448,7 +845,6 @@ def get_options_expirations(
     ]
     return expirations
 
-
 @app.get("/api/options-chain")
 def get_options_chain(
     symbol: str = Query("SPY", description="Stock Symbol"),
@@ -1457,12 +853,23 @@ def get_options_chain(
 ):
     dte = calculate_dte_from_expiration(expiration)
 
-    # Dynamic strike spacing based on stock price magnitude
+    # Fetch current IV rank from context if available, otherwise default to 0.35
+    ctx = STOCKS.get(symbol)
+    env = getattr(ctx, "bull_env", None)
+    base_env = env.unwrapped if hasattr(env, "unwrapped") else (env.envs[0] if hasattr(env, "envs") else env)
+    iv_rank = getattr(ctx, "current_iv_rank", 0.35) if ctx else 0.35
+    if hasattr(base_env, "is_inverted"):
+        row = base_env.df.iloc[base_env.data_idx]
+        iv_rank = float(row["iv_rank"])
+    # Dynamic strike spacing
     strike_step = 2.5 if current_price < 500 else 5.0
     center_strike = round(current_price / strike_step) * strike_step
     strikes = [round(center_strike + (i * strike_step), 2) for i in range(-5, 6)]
 
-    chain = [compute_option_row(current_price, strike, dte=dte) for strike in strikes]
+    chain = [
+        compute_option_row(spot=current_price, strike=strike, dte=dte, iv_rank=iv_rank)
+        for strike in strikes
+    ]
     return {"symbol": symbol, "chain": chain}
 
 
