@@ -146,13 +146,9 @@ class SPYStockSimulator:
         Emulates daily SPY price dynamics with mean-reverting drift,
         volatility clustering, and tail-risk jumps.
         """
-        self.price = initial_price
         self.initial_price = initial_price
-        
-        # Base annual parameters (SPY historical averages: ~8-10% return, ~16% vol)
         self.mu_base = annual_drift
         self.sigma_base = base_volatility
-        self.current_sigma = base_volatility
         
         # 1 trading day step
         self.dt = 1.0 / 252.0  
@@ -162,14 +158,28 @@ class SPYStockSimulator:
         
         # Jump Diffusion Parameters (Simulating sudden drops/rallies)
         self.jump_prob = 0.05       # 5% chance of a jump event on any given day
-        self.jump_mean = -0.005     # Slight negative bias on jumps (market drops faster than it rises)
+        self.jump_mean = -0.005     # Slight negative bias on jumps
         self.jump_std = 0.025       # Magnitude of news shocks
+
+        # Initialize dynamic state variables
+        self.reset()
+
+    def reset(self, new_initial_price=None):
+        """
+        Resets simulator state (price and volatility) back to initial values.
+        Optionally allows updating the initial price anchor.
+        """
+        if new_initial_price is not None:
+            self.initial_price = float(new_initial_price)
+
+        self.price = self.initial_price
+        self.current_sigma = self.sigma_base
+        return self.price
 
     def step_day(self):
         """Advances the simulator by 1 trading day."""
         # 1. Update Volatility Clustering (stochastic volatility)
         vol_shock = np.random.normal(0, 1)
-        # Volatility naturally mean-reverts to base_volatility while clustering
         self.current_sigma = max(
             0.08, 
             self.vol_persistence * self.current_sigma + 
@@ -177,9 +187,9 @@ class SPYStockSimulator:
             0.02 * abs(vol_shock)
         )
 
-        # 2. Mean-Reverting Drift Adjustment (prevents unrealistic infinite parabolic trends)
+        # 2. Mean-Reverting Drift Adjustment
         deviation_from_base = (self.price - self.initial_price) / self.initial_price
-        trend_pull = -0.05 * deviation_from_base  # Soft anchor to keep long-term growth realistic
+        trend_pull = -0.05 * deviation_from_base
         effective_mu = self.mu_base + trend_pull
 
         # 3. Standard GBM Diffusion
@@ -205,70 +215,11 @@ class SPYStockSimulator:
             prices.append(self.step_day())
         return np.array(prices)
 
-class QQQStockSimulator:
-    def __init__(self, initial_price=100.0, annual_drift=0.08, base_volatility=0.16):
-        """
-        Emulates daily SPY price dynamics with mean-reverting drift,
-        volatility clustering, and tail-risk jumps.
-        """
-        self.price = initial_price
-        self.initial_price = initial_price
-        
-        # Base annual parameters (SPY historical averages: ~8-10% return, ~16% vol)
-        self.mu_base = annual_drift
-        self.sigma_base = base_volatility
-        self.current_sigma = base_volatility
-        
-        # 1 trading day step
-        self.dt = 1.0 / 252.0  
-        
-        # Volatility clustering memory (GARCH-like persistence)
-        self.vol_persistence = 0.92
-        
-        # Jump Diffusion Parameters (Simulating sudden drops/rallies)
-        self.jump_prob = 0.05       # 5% chance of a jump event on any given day
-        self.jump_mean = -0.005     # Slight negative bias on jumps (market drops faster than it rises)
-        self.jump_std = 0.025       # Magnitude of news shocks
+import collections
+from datetime import datetime, time, timedelta
+import numpy as np
+import pandas as pd
 
-    def step_day(self):
-        """Advances the simulator by 1 trading day."""
-        # 1. Update Volatility Clustering (stochastic volatility)
-        vol_shock = np.random.normal(0, 1)
-        # Volatility naturally mean-reverts to base_volatility while clustering
-        self.current_sigma = max(
-            0.08, 
-            self.vol_persistence * self.current_sigma + 
-            (1 - self.vol_persistence) * self.sigma_base + 
-            0.02 * abs(vol_shock)
-        )
-
-        # 2. Mean-Reverting Drift Adjustment (prevents unrealistic infinite parabolic trends)
-        deviation_from_base = (self.price - self.initial_price) / self.initial_price
-        trend_pull = -0.05 * deviation_from_base  # Soft anchor to keep long-term growth realistic
-        effective_mu = self.mu_base + trend_pull
-
-        # 3. Standard GBM Diffusion
-        epsilon = np.random.normal(0, 1)
-        drift = (effective_mu - 0.5 * (self.current_sigma ** 2)) * self.dt
-        diffusion = self.current_sigma * np.sqrt(self.dt) * epsilon
-
-        # 4. Jump Shock Process (Poisson Jump Diffusion)
-        jump = 0.0
-        if np.random.rand() < self.jump_prob:
-            jump = np.random.normal(self.jump_mean, self.jump_std)
-
-        # 5. Calculate New Price
-        daily_return = np.exp(drift + diffusion + jump)
-        self.price = max(0.01, self.price * daily_return)
-
-        return round(self.price, 2)
-
-    def generate_bars(self, num_days=252):
-        """Convenience method to generate a full array of daily closing prices."""
-        prices = [self.price]
-        for _ in range(num_days):
-            prices.append(self.step_day())
-        return np.array(prices)
 
 class QQQ5mStockSimulator:
     """Simulates realistic 5-minute SPY/QQQ intraday bar data with regime-dependent jump shocks.
@@ -289,7 +240,6 @@ class QQQ5mStockSimulator:
         base_jump_prob: float = 0.0005,
         max_history: int = 300,
     ):
-        self._price = float(initial_price)
         self.initial_price = float(initial_price)
         self.max_history = max_history
 
@@ -300,7 +250,6 @@ class QQQ5mStockSimulator:
         # Drift and Volatility (annualized base)
         self.mu_base = annual_drift
         self.sigma_base = base_volatility
-        self.current_sigma = base_volatility
 
         # Volatility persistence per 5m step
         self.vol_persistence = 0.998
@@ -314,14 +263,35 @@ class QQQ5mStockSimulator:
         self.base_jump_mean = -0.002
         self.base_jump_std = 0.008
 
-        # Tracking intraday bar state
+        # Initialize environment state via reset
+        self.reset()
+
+    def reset(
+        self, initial_price: float | None = None
+    ) -> dict[str, float | float]:
+        """Resets all simulation state tracking variables for a new episode.
+
+        Optionally accepts a new `initial_price` to start an episode at a different baseline.
+        Returns the initial price/feature dictionary if needed.
+        """
+        if initial_price is not None:
+            self.initial_price = float(initial_price)
+
+        self._price = self.initial_price
+        self.current_sigma = self.sigma_base
         self.bar_index_in_day = 0
 
-        # Technical Feature State Tracking (for VWAP and Parkinson Volatility / IV Rank)
-        self.highs = collections.deque([self._price], maxlen=max_history)
-        self.lows = collections.deque([self._price], maxlen=max_history)
+        # Technical Feature State Tracking
+        self.highs = collections.deque([self._price], maxlen=self.max_history)
+        self.lows = collections.deque([self._price], maxlen=self.max_history)
         self.cum_pv = self._price * 1000.0
         self.cum_vol = 1000.0
+
+        return {
+            "price": self._price,
+            "vwap_dist": 0.0,
+            "iv_rank": 0.5,
+        }
 
     @property
     def price(self) -> float:
@@ -513,23 +483,103 @@ class QQQ5mStockSimulator:
             ]
         ]
 
-def calculate_trend_signal(price_history, window=20):
+class HistoricalCSVStockSimulator:
+    """Replays historical 5-minute CSV data sequentially as a drop-in simulator.
+
+    Interface compatible with StockContext, QQQ5mStockSimulator, and SPY environments.
     """
-    Calculates normalized trend signal: (Price - SMA_20) / SMA_20
-    - Positive values (> 0.0) indicate an uptrend (bullish momentum).
-    - Negative values (< 0.0) indicate a downtrend (bearish momentum).
-    """
-    if len(price_history) < window:
-        # Fallback for initial steps before full 20-day history is built
-        window = len(price_history)
-        
-    sma_20 = np.mean(price_history[-window:])
-    current_price = price_history[-1]
-    
-    trend_signal = (current_price - sma_20) / sma_20
-    
-    # Clip extreme values to prevent exploding gradients in RL observation space
-    return float(np.clip(trend_signal, -0.10, 0.10))
+
+    def __init__(
+        self,
+        csv_path_or_df: Union[str, Path, pd.DataFrame],
+        loop: bool = True,
+        auto_prepare: bool = True,
+    ):
+        """
+        Args:
+            csv_path_or_df: File path to spy_5m_polygon_prepared.csv or an existing DataFrame.
+            loop: If True, wraps back to row 0 when reaching the end of the dataset.
+            auto_prepare: If True, executes prepare_spy_5m_data if required features are missing.
+        """
+        if isinstance(csv_path_or_df, (str, Path)):
+            self.df = pd.read_csv(csv_path_or_df)
+        else:
+            self.df = csv_path_or_df.copy()
+
+        # Run feature preparation pipeline if essential features are missing
+        required_cols = {"close", "vwap_dist", "iv_rank", "timestamp"}
+        if auto_prepare and not required_cols.issubset(set(self.df.columns)):
+            from helpers import prepare_spy_5m_data  # Import your pipeline function
+            self.df = prepare_spy_5m_data(self.df)
+
+        # Parse timestamps and sort chronologically
+        if "timestamp" in self.df.columns:
+            self.df["timestamp"] = pd.to_datetime(self.df["timestamp"])
+            self.df = self.df.sort_values("timestamp").reset_index(drop=True)
+
+        self.loop = loop
+        self.current_idx = 0
+        self.max_idx = len(self.df)
+
+        if self.max_idx == 0:
+            raise ValueError("CSV data contains no valid rows.")
+
+    @property
+    def price(self) -> float:
+        """Exposes current close price for StockContext inspection."""
+        row = self.df.iloc[self.current_idx]
+        return float(row.get("close", row.get("price", 100.0)))
+
+    @price.setter
+    def price(self, val: float):
+        """Allows price updates for StockContext alignment."""
+        # For historical replay, this is typically a no-op or handled gracefully
+        pass
+
+    @property
+    def current_dt(self) -> Optional[datetime]:
+        """Exposes the current timestamp from the historical dataset."""
+        if "timestamp" in self.df.columns:
+            ts = self.df.iloc[self.current_idx]["timestamp"]
+            return ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        return None
+
+    def step_bar(self) -> Dict[str, Any]:
+        """Advances 1 bar forward in historical data and returns the record."""
+        row = self.df.iloc[self.current_idx]
+
+        bar_dict = {
+            "open": float(row.get("open", row.get("close", 0.0))),
+            "high": float(row.get("high", row.get("close", 0.0))),
+            "low": float(row.get("low", row.get("close", 0.0))),
+            "close": float(row.get("close", 0.0)),
+            "volume": float(row.get("volume", 1000.0)),
+            "vwap_dist": float(row.get("vwap_dist", 0.0)),
+            "iv_rank": float(row.get("iv_rank", 0.35)),
+            "ret_1": float(row.get("ret_1", 0.0)),
+            "ret_3": float(row.get("ret_3", 0.0)),
+            "ret_6": float(row.get("ret_6", 0.0)),
+            "timestamp": row.get("timestamp", None),
+        }
+
+        # Advance pointer
+        self.current_idx += 1
+        if self.current_idx >= self.max_idx:
+            if self.loop:
+                self.current_idx = 0
+            else:
+                self.current_idx = self.max_idx - 1
+
+        return bar_dict
+
+    def step_5m(self) -> Dict[str, Any]:
+        """Explicit alias for StockContext 5m stepping."""
+        return self.step_bar()
+
+    def reset(self, start_idx: int = 0):
+        """Resets the replay pointer back to start_idx or 0."""
+        self.current_idx = min(max(0, start_idx), self.max_idx - 1)
+
 
 # Daily Stock Simulator (SPY)
 #spy_sim = SPYStockSimulator(initial_price=450.0, annual_drift=0.09, base_volatility=0.18)
@@ -539,9 +589,16 @@ def calculate_trend_signal(price_history, window=20):
 #qqq_sim = QQQStockSimulator(initial_price=380.0, base_volatility=0.22)
 #qqq_recent_prices = [qqq_sim.price]
 
+CSV_FILE = Path("spy_5m_polygon_prepared.csv")
+
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
+# 1. Instantiate Historical CSV Simulator
+historical_sim = HistoricalCSVStockSimulator(
+    csv_path_or_df=MODELS_DIR / CSV_FILE,
+    loop=True
+)
 # -------------------------------------------------------------------
 # 1. HELPER FUNCTIONS & TIME MANAGEMENT
 # -------------------------------------------------------------------
@@ -636,7 +693,7 @@ class StockContext:
     recent_iv_rank: List[float] = field(default_factory=list)
 
     def _sync_env_buffers(self, env: Any):
-        """Pushes rolling price and feature buffers into 1d or 5m environments."""
+        """Pushes rolling price and feature buffers into 1d or 5m environments cleanly."""
         prices_list = self.recent_prices.copy()
         prices_arr = np.array(prices_list, dtype=np.float32)
 
@@ -648,23 +705,30 @@ class StockContext:
         if hasattr(env, "stock_prices"):
             env.stock_prices = prices_list.copy()
 
-        # Update pandas DataFrame for 5m models initialized with df_5m
+        # Update pandas DataFrame safely without destroying extra feature columns
         if hasattr(env, "df") and isinstance(env.df, pd.DataFrame):
             n_rows = len(env.df)
             n_buffer = len(prices_list)
 
-            # Keep DataFrame length matching current rolling buffer length
+            # Append/Modify rows in place rather than replacing the object
             if n_rows != n_buffer:
-                env.df = pd.DataFrame(
-                    {
-                        "close": prices_arr,
-                        "high": prices_arr,
-                        "low": prices_arr,
-                        "volume": [1000.0] * n_buffer,
-                        "vwap_dist": np.array(self.recent_vwap_dist, dtype=np.float32),
-                        "iv_rank": np.array(self.recent_iv_rank, dtype=np.float32),
-                    }
-                )
+                # Retain existing columns or construct default dictionary
+                data_dict = {
+                    "close": prices_arr,
+                    "high": prices_arr * 1.0005,
+                    "low": prices_arr * 0.9995,
+                    "volume": [1000.0] * n_buffer,
+                    "vwap_dist": np.array(
+                        self.recent_vwap_dist, dtype=np.float32
+                    ),
+                    "iv_rank": np.array(self.recent_iv_rank, dtype=np.float32),
+                }
+                # Preserve existing non-standard columns (e.g. dte) if present
+                for col in env.df.columns:
+                    if col not in data_dict:
+                        data_dict[col] = env.df[col].values[-n_buffer:] if len(env.df[col]) >= n_buffer else [0.0] * n_buffer
+
+                env.df = pd.DataFrame(data_dict)
             else:
                 env.df["close"] = prices_arr
                 if "vwap_dist" in env.df.columns:
@@ -677,8 +741,14 @@ class StockContext:
                     )
 
             # Keep env raw price lists perfectly in sync with internal df
-            env.raw_spy_prices = env.df["close"].values.astype(np.float32).tolist()
+            env.raw_spy_prices = (
+                env.df["close"].values.astype(np.float32).tolist()
+            )
             env.spy_prices = env.raw_spy_prices.copy()
+
+            # Ensure current price attribute on the environment is synced
+            if hasattr(env, "price"):
+                env.price = prices_list[-1]
 
     def reset_state(self):
         """Resets buffers and restores initial state."""
@@ -738,7 +808,7 @@ class StockContext:
         self._sync_env_buffers(self.bear_env)
 
         return price
-
+    
     def get_formatted_time(self) -> str:
         if self.current_dt.tzinfo is None:
             utc_dt = self.current_dt.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
@@ -752,7 +822,6 @@ class StockContext:
 
         return eastern_dt.strftime("%Y-%m-%d")
 
-
 def build_stock_context(
     symbol: str,
     interval: str,
@@ -765,23 +834,80 @@ def build_stock_context(
     bear_norm_file: Optional[str] = None,
 ) -> StockContext:
     """Factory builder for registering any stock model into runtime context."""
-    init_price = float(getattr(simulator, "price", 100.0))
-    prices_buffer = [init_price] * 300
-    vwap_buffer = [0.0] * 300
-    iv_buffer = [0.5] * 300
 
-    # Build seed DataFrame for 5m models that require `df_5m` in __init__
+    prices_buffer = []
+    vwap_buffer = []
+    iv_buffer = []
+    high_prices = []
+    low_prices = []
+    volume_buffer = []
+
+    # --------------------------------------------------------------------------
+    # 1. Populate buffers according to Simulator Type
+    # --------------------------------------------------------------------------
+    
+    # CASE A: Historical CSV Simulator (Slices directly - no pointer movement, no reset needed)
+    if hasattr(simulator, "df") and isinstance(getattr(simulator, "df"), pd.DataFrame) and len(simulator.df) >= 300:
+        historical_slice = simulator.df.iloc[:300]
+        prices_buffer = historical_slice["close"].astype(float).tolist()
+        high_prices = historical_slice["high"].astype(float).tolist() if "high" in historical_slice.columns else [p * 1.001 for p in prices_buffer]
+        low_prices = historical_slice["low"].astype(float).tolist() if "low" in historical_slice.columns else [p * 0.999 for p in prices_buffer]
+        volume_buffer = historical_slice["volume"].astype(float).tolist() if "volume" in historical_slice.columns else [1000.0] * 300
+        vwap_buffer = historical_slice["vwap_dist"].astype(float).tolist() if "vwap_dist" in historical_slice.columns else [0.0] * 300
+        iv_buffer = historical_slice["iv_rank"].astype(float).tolist() if "iv_rank" in historical_slice.columns else [0.5] * 300
+
+    # CASE B: Dynamic Intraday 5m Simulator (QQQ5mStockSimulator)
+    elif hasattr(simulator, "step_bar") or hasattr(simulator, "step_5m"):
+        step_fn = getattr(simulator, "step_bar", getattr(simulator, "step_5m", None))
+        for _ in range(300):
+            bar = step_fn()
+            prices_buffer.append(float(bar["close"]))
+            high_prices.append(float(bar["high"]))
+            low_prices.append(float(bar["low"]))
+            volume_buffer.append(float(bar["volume"]))
+            vwap_buffer.append(float(bar["vwap_dist"]))
+            iv_buffer.append(float(bar["iv_rank"]))
+            
+        # Reset AFTER consuming 300 bars so live evaluation starts at step 0
+        if hasattr(simulator, "reset"):
+            simulator.reset()
+
+    # CASE C: 1D Stochastic Simulator (SPYStockSimulator)
+    elif hasattr(simulator, "step_day"):
+        for _ in range(300):
+            p = float(simulator.step_day())
+            prices_buffer.append(p)
+            high_prices.append(p * 1.001)
+            low_prices.append(p * 0.999)
+            volume_buffer.append(1000.0)
+            vwap_buffer.append(0.0)
+            iv_buffer.append(0.5)
+            
+        # Reset stochastic simulator back to initial anchor price
+        if hasattr(simulator, "reset"):
+            simulator.reset()
+
+    # Align simulator's current price pointer to last seeded price
+    if prices_buffer:
+        simulator.price = prices_buffer[-1]
+
+    # --------------------------------------------------------------------------
+    # 2. Build seed DataFrame for 5m models requiring `df_5m`
+    # --------------------------------------------------------------------------
     seed_df = pd.DataFrame(
         {
             "close": prices_buffer,
-            "high": prices_buffer,
-            "low": prices_buffer,
-            "volume": [1000.0] * 300,
+            "high": high_prices,
+            "low": low_prices,
+            "volume": volume_buffer,
             "vwap_dist": vwap_buffer,
             "iv_rank": iv_buffer,
         }
     )
 
+    # --------------------------------------------------------------------------
+    # 3. Environment Instantiation & Setup
+    # --------------------------------------------------------------------------
     def instantiate_env(env_cls):
         sig = inspect.signature(env_cls.__init__)
         params = sig.parameters
@@ -792,15 +918,13 @@ def build_stock_context(
         if "train" in params:
             kwargs["train"] = False
 
-        # If model expects `df_5m` (5m environment)
         if "df_5m" in params:
             kwargs["df_5m"] = seed_df.copy()
 
-        # If model expects raw price lists (1d environment)
         if "spy_prices" in params:
-            kwargs["spy_prices"] = prices_buffer
+            kwargs["spy_prices"] = prices_buffer.copy()
         elif "stock_prices" in params:
-            kwargs["stock_prices"] = prices_buffer
+            kwargs["stock_prices"] = prices_buffer.copy()
 
         return env_cls(**kwargs)
 
@@ -810,7 +934,7 @@ def build_stock_context(
     bull_vec_env = DummyVecEnv([lambda: bull_env])
     bear_vec_env = DummyVecEnv([lambda: bear_env])
 
-    # Handle Bull Agent Normalization
+    # Bull Agent Normalization
     if bull_norm_file:
         bull_norm = VecNormalize.load(
             str(MODELS_DIR / bull_norm_file), bull_vec_env
@@ -823,7 +947,7 @@ def build_stock_context(
 
     bull_npc = load_ppo_model_safe(bull_model_file, bull_eval_env)
 
-    # Handle Bear Agent Normalization
+    # Bear Agent Normalization
     if bear_norm_file:
         bear_norm = VecNormalize.load(
             str(MODELS_DIR / bear_norm_file), bear_vec_env
@@ -860,7 +984,6 @@ def build_stock_context(
         recent_iv_rank=iv_buffer,
     )
 
-
 # --- GLOBAL STOCKS REGISTRY ---
 STOCKS: Dict[str, StockContext] = {
     "SPY": build_stock_context(
@@ -885,6 +1008,15 @@ STOCKS: Dict[str, StockContext] = {
         bull_model_file="best_model_bi_v2(110).zip",
         bear_model_file="best_model_only_puts(135).zip",
     ),
+    "SPO": build_stock_context(
+        symbol="SPO",
+        interval="5m",
+        simulator=historical_sim,
+        bull_env_cls=SPYOptionsEnv5m,
+        bear_env_cls=SPYOptionsEnv5m,
+        bull_model_file="best_model_bi_v2(110).zip",
+        bear_model_file="best_model_only_puts(135).zip",
+    )
 }
 
 
@@ -917,43 +1049,87 @@ def parse_npc_action(agent_name: str, action_vec: Any, current_price: float, env
 
 
 def step_agent(
-    npc: PPO, 
-    norm_env: Optional[VecNormalize], 
-    env: Any, 
-    current_price: float, 
-    agent_name: str
+    npc: PPO,
+    norm_env: Optional[VecNormalize],
+    env: Any,
+    current_price: float,
+    agent_name: str,
 ) -> dict:
-    prev_contracts = env.contracts
-    
-    # Get raw observation from environment
-    raw_obs = env._get_normalized_observation()
-    
-    # Ensure vector format for batch inference
-    obs_batch = np.array([raw_obs])
-    
-    # Apply VecNormalize ONLY if a normalization object exists (1-day model)
+    prev_contracts = getattr(env, "contracts", 0)
+
+    # 1. Fetch Observation Vector from Environment
+    if hasattr(env, "_get_normalized_observation"):
+        raw_obs = env._get_normalized_observation()
+    elif hasattr(env, "_get_obs"):
+        raw_obs = env._get_obs()
+    elif hasattr(env, "get_obs"):
+        raw_obs = env.get_obs()
+    else:
+        raw_obs = getattr(env, "observation", np.zeros(10))
+
+    # Format as flat float32 array and expand batch dim for PPO ([1, obs_dim])
+    raw_obs = np.asarray(raw_obs, dtype=np.float32).flatten()
+    obs_batch = np.expand_dims(raw_obs, axis=0)
+
+    # 2. Normalize Observation if VecNormalize wrapper is present
     if norm_env is not None:
+        norm_env.training = False
         norm_obs = norm_env.normalize_obs(obs_batch)
     else:
-        norm_obs = obs_batch  # 5-minute model (already normalized internally)
+        norm_obs = obs_batch
 
-    # Predict action
+    # 3. Predict Action via PPO
     action, _ = npc.predict(norm_obs, deterministic=True)
-    act_vec = action[0] if action.ndim > 1 else action
+    act_vec = action[0] if isinstance(action, np.ndarray) and action.ndim > 1 else action
 
-    # Advance environment state
-    env.step(act_vec)
+    # 4. Advance Environment Internal State Pointer
+    step_res = env.step(act_vec)
+    if len(step_res) == 5:
+        _, reward, terminated, truncated, info = step_res
+        done = terminated or truncated
+    else:
+        _, reward, done, info = step_res
 
-    action_log = parse_npc_action(agent_name, act_vec, current_price, env, prev_contracts=prev_contracts)
-    portfolio_val = env._get_portfolio_value(current_price)
+    # Force internal step index forward if custom env uses current_step tracking
+    if hasattr(env, "current_step"):
+        env.current_step += 1
+
+    # 5. Handle Episode/Option Expiration Soft Reset
+    if done or getattr(env, "last_event", None) in ["EXPIRED", "STOP_LOSS", "TAKE_PROFIT"]:
+        if hasattr(env, "close_position") and getattr(env, "contracts", 0) > 0:
+            try:
+                env.close_position(current_price)
+            except Exception:
+                pass
+
+        # Reset position tracking variables without wiping streaming price buffers
+        if hasattr(env, "contracts"):
+            env.contracts = 0
+        if hasattr(env, "position"):
+            env.position = 0
+
+    # 6. Parse Action Log & Portfolio Return
+    action_log = parse_npc_action(
+        agent_name,
+        act_vec,
+        current_price,
+        env,
+        prev_contracts=prev_contracts,
+    )
+
+    if hasattr(env, "_get_portfolio_value"):
+        portfolio_val = env._get_portfolio_value(current_price)
+    elif hasattr(env, "cash") and hasattr(env, "contracts"):
+        portfolio_val = env.cash + (env.contracts * current_price * 100.0)
+    else:
+        portfolio_val = getattr(env, "portfolio_value", 10000.0)
 
     return {
-        "action": action_log,
+        "action": str(action_log),
         "portfolio_value": round(float(portfolio_val), 2),
-        "cash": round(float(env.cash), 2),
-        "contracts": int(env.contracts),
+        "cash": round(float(getattr(env, "cash", 0.0)), 2),
+        "contracts": int(getattr(env, "contracts", 0)),
     }
-
 
 # -------------------------------------------------------------------
 # 4. MODULAR REST API ENDPOINTS
@@ -994,6 +1170,25 @@ def get_options_chain(
 # 5. WEBSOCKET LOOP (PARALLEL TICKING FOR ALL STOCKS)
 # -------------------------------------------------------------------
 
+def sanitize_payload(obj):
+    """Recursively casts NumPy/Pandas data types into native JSON-serializable Python types."""
+    if isinstance(obj, dict):
+        return {k: sanitize_payload(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_payload(v) for v in obj]
+    elif isinstance(obj, (np.floating, np.complexfloating)):
+        return float(obj)
+    elif isinstance(obj, (np.integer, np.signedinteger, np.unsignedinteger)):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (pd.Timestamp, datetime)):
+        return str(obj)
+    elif pd.isna(obj):
+        return None
+    return obj
+
+
 @app.websocket("/ws/stocks")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -1015,27 +1210,47 @@ async def websocket_endpoint(websocket: WebSocket):
                 price = ctx.step()
 
                 # Step Agents for this stock
-                bull_data = step_agent(ctx.bull_npc, ctx.bull_norm, ctx.bull_env, price, f"{symbol}_Bull_NPC")
-                bear_data = step_agent(ctx.bear_npc, ctx.bear_norm, ctx.bear_env, price, f"{symbol}_Bear_NPC")
+                bull_data = step_agent(
+                    ctx.bull_npc,
+                    ctx.bull_norm,
+                    ctx.bull_env,
+                    price,
+                    f"{symbol}_Bull_NPC",
+                )
+                bear_data = step_agent(
+                    ctx.bear_npc,
+                    ctx.bear_norm,
+                    ctx.bear_env,
+                    price,
+                    f"{symbol}_Bear_NPC",
+                )
 
                 # Record Payloads
                 dates_payload[symbol] = ctx.get_formatted_time()
-                data_payload[symbol] = round(price, 2)
+                data_payload[symbol] = (
+                    round(float(price), 2) if price is not None else 0.0
+                )
                 npcs_payload[symbol] = {
                     "bull": bull_data,
-                    "bear": bear_data
+                    "bear": bear_data,
                 }
 
                 # Collect Active Trade Logs across all stocks
-                # Include ALL actions, or add "HELD" to the keyword filter
                 for data in [bull_data, bear_data]:
-                    action_str = data.get("action", "")
-                    # Add HELD if you want continuous updates every 3 seconds
-                    if any(kw in action_str for kw in ["BOUGHT", "CLOSED", "LIQUIDATED", "EXPIRED", "HELD"]):
-                        active_logs.append({
-                            "text": action_str,
-                            "symbol": symbol
-                        })
+                    action_str = str(data.get("action", ""))
+                    if any(
+                        kw in action_str
+                        for kw in [
+                            "BOUGHT",
+                            "CLOSED",
+                            "LIQUIDATED",
+                            "EXPIRED",
+                            "HELD",
+                        ]
+                    ):
+                        active_logs.append(
+                            {"text": action_str, "symbol": symbol}
+                        )
 
             # Consolidated Packet for ALL symbols
             packet = {
@@ -1043,10 +1258,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 "dates": dates_payload,
                 "data": data_payload,
                 "npcs": npcs_payload,
-                "logs": active_logs
+                "logs": active_logs,
             }
 
-            await websocket.send_json(packet)
+            # Sanitize numpy types to prevent JSON serialization crash on step 2
+            safe_packet = sanitize_payload(packet)
+
+            await websocket.send_json(safe_packet)
             await asyncio.sleep(3)
 
     except WebSocketDisconnect:
@@ -1054,5 +1272,9 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"❌ Error in WebSocket loop: {e}")
         import traceback
+
         traceback.print_exc()
-        await websocket.close()
+        try:
+            await websocket.close()
+        except Exception:
+            pass  # Socket was already closed or broken
