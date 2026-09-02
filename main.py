@@ -1,7 +1,7 @@
 import asyncio
 import io
 import logging
-import math
+import json
 import zipfile
 import time as time_module
 from dataclasses import dataclass, field
@@ -900,10 +900,25 @@ def sanitize_payload(obj):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("Frontend client connected!")
+    tick_delay = 3.0  # Default delay (seconds)
 
     # Reset state for all registered stock contexts
     for ctx in STOCKS.values():
         ctx.reset_state()
+
+    # Async task to listen for client control messages without blocking tick execution
+    async def listen_for_controls():
+        nonlocal tick_delay
+        try:
+            while True:
+                data = await websocket.receive_text()
+                msg = json.loads(data)
+                if msg.get("type") == "SET_SPEED":
+                    tick_delay = float(msg.get("speed", 1.0))
+        except WebSocketDisconnect:
+            pass
+
+    listen_task = asyncio.create_task(listen_for_controls())
 
     try:
         while True:
@@ -973,7 +988,7 @@ async def websocket_endpoint(websocket: WebSocket):
             safe_packet = sanitize_payload(packet)
 
             await websocket.send_json(safe_packet)
-            await asyncio.sleep(3)
+            await asyncio.sleep(tick_delay)
 
     except WebSocketDisconnect:
         print("Frontend client disconnected cleanly.")
@@ -986,3 +1001,5 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass  # Socket was already closed or broken
+    finally:
+        listen_task.cancel()

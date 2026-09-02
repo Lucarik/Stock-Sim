@@ -2,15 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createChart, LineSeries, CandlestickSeries } from 'lightweight-charts';
 import { OptionsChain, PositionsTable } from "./OptionsChainModal";
 import { SideTabs } from './SideTabs';
-
-// Helper to parse date strings or unix timestamps into Date objects
-const parseSimDate = (dateVal) => {
-  if (!dateVal) return new Date();
-  if (typeof dateVal === 'number') {
-    return new Date(dateVal > 1e11 ? dateVal : dateVal * 1000);
-  }
-  return new Date(dateVal);
-};
+import {calculateSMA, calculateVWAP} from './helper1';
 
 // Check if timestamp string represents intraday (has non-zero time)
 const isIntradayDate = (dateStr) => {
@@ -74,6 +66,18 @@ export default function App() {
   useEffect(() => {
     selectedIntervalRef.current = selectedInterval;
   }, [selectedInterval]);
+
+  // Tick Rate Speed State (1s, 3s, 5s default options)
+  const [tickSpeed, setTickSpeed] = useState(3); // Default 3 seconds
+  const wsRef = useRef(null); // Ref to hold the active WebSocket connection
+
+  // Send speed update over existing socket connection
+  const handleSpeedChange = (newSpeed) => {
+    setTickSpeed(newSpeed);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'SET_SPEED', speed: newSpeed }));
+    }
+  };
 
   const selectedSymbolRef = useRef(selectedSymbol);
   useEffect(() => {
@@ -262,6 +266,7 @@ export default function App() {
   useEffect(() => {
     let isMounted = true;
     const ws = new WebSocket('ws://localhost:8000/ws/stocks');
+    wsRef.current = ws;
 
     ws.onopen = () => {
       if (!isMounted) return ws.close();
@@ -379,6 +384,7 @@ export default function App() {
       } else if (ws.readyState === WebSocket.CONNECTING) {
         ws.onopen = () => ws.close();
       }
+      wsRef.current = null;
     };
   }, []);
 
@@ -513,6 +519,32 @@ export default function App() {
               </option>
             ))}
           </select>
+        </div>
+
+        {/* Tick Rate Speed Selector Controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <label style={{ color: '#94a3b8', fontSize: '13px', fontWeight: 'bold' }}>Speed:</label>
+          <div style={{ display: 'flex', gap: '4px', backgroundColor: '#0f172a', padding: '2px', borderRadius: '6px', border: '1px solid #1e293b' }}>
+            {[1, 3, 5, 50].map((speed) => (
+              <button
+                key={speed}
+                onClick={() => handleSpeedChange(speed)}
+                style={{
+                  padding: '4px 8px',
+                  borderRadius: '4px',
+                  border: 'none',
+                  backgroundColor: tickSpeed === speed ? '#38bdf8' : 'transparent',
+                  color: tickSpeed === speed ? '#0f172a' : '#94a3b8',
+                  fontWeight: 'bold',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                  transition: 'all 0.2s',
+                }}
+              >
+                {speed}s
+              </button>
+            ))}
+          </div>
         </div>
 
         {currentPrice !== 0 && (
