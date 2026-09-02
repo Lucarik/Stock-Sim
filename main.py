@@ -4,9 +4,11 @@ import logging
 import math
 import zipfile
 import time as time_module
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, time
+import zoneinfo
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Dict, List, Any
 
 import gymnasium as gym
 import numpy as np
@@ -133,58 +135,6 @@ def calculate_dte_from_expiration(
         return max(0, days_diff)  # Ensure non-negative DTE
     except ValueError:
         return 7
-
-
-@app.get("/api/options-expirations")
-def get_options_expirations(
-    simulated_date: Optional[str] = Query(None, alias="simulated_date")
-):
-    sim_today = parse_sim_date(simulated_date)
-
-    sample_offsets = [0, 1, 7, 14, 30, 45, 60]
-    expirations = [
-        (sim_today + timedelta(days=days)).strftime("%Y-%m-%d")
-        for days in sample_offsets
-    ]
-    return expirations
-
-# 2. Updated options chain route accepting `expiration`
-@app.get("/api/options-chain")
-def get_options_chain(
-    current_price: float = Query(..., description="Spot price from WebSocket"),
-    expiration: Optional[str] = Query(None, description="ISO Expiration date (YYYY-MM-DD)")
-):
-    # Compute actual DTE from the passed expiration string
-    dte = calculate_dte_from_expiration(expiration)
-
-    print(f"[API TICK RECEIVED] Spot: {current_price} | Expiration: {expiration} (Calculated DTE: {dte})")
-    
-    # Generate strikes dynamically around the current spot price
-    center_strike = round(current_price / 2.5) * 2.5
-    strikes = [round(center_strike + (i * 2.5), 2) for i in range(-5, 6)]
-    
-    # Compute option row passing the calculated DTE
-    chain = [compute_option_row(current_price, strike, dte=dte) for strike in strikes]
-    
-    return {"chain": chain}
-
-def calculate_trend_signal(price_history, window=20):
-    """
-    Calculates normalized trend signal: (Price - SMA_20) / SMA_20
-    - Positive values (> 0.0) indicate an uptrend (bullish momentum).
-    - Negative values (< 0.0) indicate a downtrend (bearish momentum).
-    """
-    if len(price_history) < window:
-        # Fallback for initial steps before full 20-day history is built
-        window = len(price_history)
-        
-    sma_20 = np.mean(price_history[-window:])
-    current_price = price_history[-1]
-    
-    trend_signal = (current_price - sma_20) / sma_20
-    
-    # Clip extreme values to prevent exploding gradients in RL observation space
-    return float(np.clip(trend_signal, -0.10, 0.10))
 
 class SPYStockSimulator:
     def __init__(self, initial_price=100.0, annual_drift=0.08, base_volatility=0.16):
@@ -316,54 +266,93 @@ class QQQStockSimulator:
             prices.append(self.step_day())
         return np.array(prices)
 
+def calculate_trend_signal(price_history, window=20):
+    """
+    Calculates normalized trend signal: (Price - SMA_20) / SMA_20
+    - Positive values (> 0.0) indicate an uptrend (bullish momentum).
+    - Negative values (< 0.0) indicate a downtrend (bearish momentum).
+    """
+    if len(price_history) < window:
+        # Fallback for initial steps before full 20-day history is built
+        window = len(price_history)
+        
+    sma_20 = np.mean(price_history[-window:])
+    current_price = price_history[-1]
+    
+    trend_signal = (current_price - sma_20) / sma_20
+    
+    # Clip extreme values to prevent exploding gradients in RL observation space
+    return float(np.clip(trend_signal, -0.10, 0.10))
+
 # Daily Stock Simulator (SPY)
-spy_sim = SPYStockSimulator(initial_price=450.0, annual_drift=0.09, base_volatility=0.18)
-spy_recent_prices = [spy_sim.price]
+#spy_sim = SPYStockSimulator(initial_price=450.0, annual_drift=0.09, base_volatility=0.18)
+#spy_recent_prices = [spy_sim.price]
 
 # 5-Minute Intraday Stock Simulator (e.g., QQQ)
-qqq_sim = QQQStockSimulator(initial_price=380.0, base_volatility=0.22)
-qqq_recent_prices = [qqq_sim.price]
+#qqq_sim = QQQStockSimulator(initial_price=380.0, base_volatility=0.22)
+#qqq_recent_prices = [qqq_sim.price]
+
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+
+# -------------------------------------------------------------------
+# 1. HELPER FUNCTIONS & TIME MANAGEMENT
+# -------------------------------------------------------------------
+
+def parse_sim_date(
+    date_val: Optional[Union[str, date, datetime]]
+) -> date:
+    """Helper to reliably parse simulation dates into datetime.date objects."""
+    # 1. Clean up string input (handle empty string, "null", "undefined", etc.)
+    if isinstance(date_val, str):
+        date_val = date_val.strip()
+        if not date_val or date_val.lower() in ("none", "null", "undefined"):
+            date_val = None
+
+    # 2. Guard for None
+    if date_val is None:
+        # Changed warning -> info/debug so expected default route behavior doesn't trigger console warnings
+        logging.info("parse_sim_date received None or empty value. Defaulting to system date.today().")
+        return date.today()
+
+    if isinstance(date_val, datetime):
+        return date_val.date()
+    if isinstance(date_val, date):
+        return date_val
+
+    try:
+        return datetime.fromisoformat(str(date_val).replace("Z", "")).date()
+    except ValueError:
+        try:
+            return datetime.strptime(str(date_val)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            # Keep warning here because an unparseable string IS an actual error!
+            logging.warning(f"parse_sim_date failed to parse '{date_val}'. Defaulting to date.today().")
+            return date.today()
 
 
-# Helper: Advance 5-minute timestamps skipping overnight & weekends
 def step_5m(current_dt: datetime) -> datetime:
+    """Advances time by 5 minutes, skipping non-trading hours and weekends."""
     next_dt = current_dt + timedelta(minutes=5)
-
-    # Market closes after 16:00 -> Jump to next day's open at 09:30
-    if next_dt.time() > time(16, 0):  # Changed >= to > so 16:00 is preserved
+    
+    # After 16:00 market close -> Jump to 09:30 next day
+    if next_dt.time() > time(16, 0):
         next_dt = datetime.combine(next_dt.date() + timedelta(days=1), time(9, 30))
 
-    # If new day lands on Weekend (Saturday/Sunday) -> Jump to Monday 09:30
+    # Skip weekends
     while next_dt.weekday() in (5, 6):
         next_dt = datetime.combine(next_dt.date() + timedelta(days=1), time(9, 30))
 
     return next_dt
 
 
-# -------------------------------------------------------------------
-# 2. INSTANTIATE ENVIRONMENTS & LOAD MODELS
-# -------------------------------------------------------------------
+def step_1d(current_dt: datetime) -> datetime:
+    """Advances time by 1 day, skipping weekends."""
+    next_dt = current_dt + timedelta(days=1)
+    while next_dt.weekday() in (5, 6):
+        next_dt += timedelta(days=1)
+    return next_dt
 
-# --- SPY Environments (Daily) ---
-spy_bull_env = SPYOptionsEnvCalls(spy_prices=[spy_sim.price] * 300)
-spy_bear_env = SPYOptionsEnvPuts(spy_prices=[spy_sim.price] * 300)
-spy_bull_env.reset()
-spy_bear_env.reset()
-
-spy_bull_vec_env = DummyVecEnv([lambda: spy_bull_env])
-spy_bear_vec_env = DummyVecEnv([lambda: spy_bear_env])
-
-# --- QQQ Environments (5-Minute Intraday) ---
-qqq_bull_env = QQQOptionsEnvCalls(spy_prices=[qqq_sim.price] * 300)
-qqq_bear_env = QQQOptionsEnvPuts(spy_prices=[qqq_sim.price] * 300)
-qqq_bull_env.reset()
-qqq_bear_env.reset()
-qqq_bull_vec_env = DummyVecEnv([lambda: qqq_bull_env])
-qqq_bear_vec_env = DummyVecEnv([lambda: qqq_bear_env])
-
-# Resolve base directory relative to main.py
-BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
 
 def load_ppo_model_safe(zip_filename: str, vec_env) -> PPO:
     """Safely reads policy.pth into an in-memory buffer bypassing Windows zip errors."""
@@ -379,30 +368,169 @@ def load_ppo_model_safe(zip_filename: str, vec_env) -> PPO:
     return model
 
 
-# Load SPY Agents
-spy_bull_npc = load_ppo_model_safe("ppo_spy_options_bull_specialist.zip", spy_bull_vec_env)
-spy_bull_norm = VecNormalize.load(str(MODELS_DIR / "vec_normalize_bull_specialist.pkl"), spy_bull_vec_env)
-spy_bull_norm.training = False
+# -------------------------------------------------------------------
+# 2. MODULAR STOCK REGISTRY ARCHITECTURE
+# -------------------------------------------------------------------
 
-spy_bear_npc = load_ppo_model_safe("ppo_spy_options_bear_specialist.zip", spy_bear_vec_env)
-spy_bear_norm = VecNormalize.load(str(MODELS_DIR / "vec_normalize_bear_specialist.pkl"), spy_bear_vec_env)
-spy_bear_norm.training = False
+# -------------------------------------------------------------------
+# MODULAR STOCK REGISTRY ARCHITECTURE (UPDATED)
+# -------------------------------------------------------------------
 
-# Load QQQ 5-Minute Agents
-qqq_bull_npc = load_ppo_model_safe("ppo_spy_options_bull_specialist.zip", qqq_bull_vec_env)
-qqq_bull_norm = VecNormalize.load(str(MODELS_DIR / "vec_normalize_bull_specialist.pkl"), qqq_bull_vec_env)
-qqq_bull_norm.training = False
+@dataclass
+class StockContext:
+    symbol: str
+    interval: str  # "1d" or "5m"
+    simulator: Any
+    bull_env: Any
+    bear_env: Any
+    bull_npc: PPO
+    bull_norm: VecNormalize
+    bear_npc: PPO
+    bear_norm: VecNormalize
+    current_dt: datetime
+    initial_dt: datetime  # STORE INITIAL DATE TO RESTORE ON RESET
+    recent_prices: List[float] = field(default_factory=list)
 
-qqq_bear_npc = load_ppo_model_safe("ppo_spy_options_bear_specialist.zip", qqq_bear_vec_env)
-qqq_bear_norm = VecNormalize.load(str(MODELS_DIR / "vec_normalize_bear_specialist.pkl"), qqq_bear_vec_env)
-qqq_bear_norm.training = False
+    def reset_state(self):
+        """Resets price buffers and restores initial datetime for websocket re-connection."""
+        init_price = self.simulator.price
+        self.recent_prices = [init_price] * 300
+        
+        # Reset Environments
+        if hasattr(self.bull_env, "spy_prices"):
+            self.bull_env.spy_prices = self.recent_prices.copy()
+            self.bear_env.spy_prices = self.recent_prices.copy()
+        else:
+            self.bull_env.stock_prices = self.recent_prices.copy()
+            self.bear_env.stock_prices = self.recent_prices.copy()
+
+        self.bull_env.reset()
+        self.bear_env.reset()
+
+        # FIX: Restore to saved initial_dt instead of regenerating datetime.now()
+        self.current_dt = self.initial_dt
+
+    def step(self) -> float:
+        """Ticks simulator and advances timestamp regardless of active UI tab."""
+        if self.interval == "5m":
+            self.current_dt = step_5m(self.current_dt)
+            price = float(self.simulator.step_5m() if hasattr(self.simulator, 'step_5m') else self.simulator.step_day())
+        else:
+            self.current_dt = step_1d(self.current_dt)
+            price = float(self.simulator.step_day())
+
+        self.recent_prices.append(price)
+        if len(self.recent_prices) > 300:
+            self.recent_prices.pop(0)
+
+        # Sync updated prices into environments
+        if hasattr(self.bull_env, "spy_prices"):
+            self.bull_env.spy_prices = self.recent_prices.copy()
+            self.bear_env.spy_prices = self.recent_prices.copy()
+        else:
+            self.bull_env.stock_prices = self.recent_prices.copy()
+            self.bear_env.stock_prices = self.recent_prices.copy()
+
+        return price
+
+    def get_formatted_time(self) -> str:
+        # 1. Ensure datetime has timezone info (assume UTC if naive)
+        if self.current_dt.tzinfo is None:
+            utc_dt = self.current_dt.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+        else:
+            utc_dt = self.current_dt
+
+        # 2. Convert to US Eastern Time (handles EST/EDT daylight saving shifts automatically)
+        eastern_dt = utc_dt.astimezone(zoneinfo.ZoneInfo("America/New_York"))
+
+        # 3. Format string based on chart interval requirement
+        if self.interval == "5m":
+            return eastern_dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        return eastern_dt.strftime("%Y-%m-%d")
+
+
+def build_stock_context(
+    symbol: str,
+    interval: str,
+    simulator: Any,
+    bull_env_cls: type,
+    bear_env_cls: type,
+    bull_model_file: str,
+    bull_norm_file: str,
+    bear_model_file: str,
+    bear_norm_file: str
+) -> StockContext:
+    """Factory builder for registering any new stock into the runtime context."""
+    init_price = simulator.price
+    prices_buffer = [init_price] * 300
+
+    bull_env = bull_env_cls(spy_prices=prices_buffer) if "spy_prices" in bull_env_cls.__init__.__code__.co_varnames else bull_env_cls(stock_prices=prices_buffer)
+    bear_env = bear_env_cls(spy_prices=prices_buffer) if "spy_prices" in bear_env_cls.__init__.__code__.co_varnames else bear_env_cls(stock_prices=prices_buffer)
+
+    bull_vec_env = DummyVecEnv([lambda: bull_env])
+    bear_vec_env = DummyVecEnv([lambda: bear_env])
+
+    bull_npc = load_ppo_model_safe(bull_model_file, bull_vec_env)
+    bull_norm = VecNormalize.load(str(MODELS_DIR / bull_norm_file), bull_vec_env)
+    bull_norm.training = False
+
+    bear_npc = load_ppo_model_safe(bear_model_file, bear_vec_env)
+    bear_norm = VecNormalize.load(str(MODELS_DIR / bear_norm_file), bear_vec_env)
+    bear_norm.training = False
+
+    # Define base start date (e.g. 300 days in past for daily data to allow history)
+    start_base_date = datetime.now().date() - timedelta(days=300 if interval == "1d" else 0)
+    init_dt = datetime.combine(start_base_date, time(9, 30) if interval == "5m" else time(0, 0))
+
+    return StockContext(
+        symbol=symbol,
+        interval=interval,
+        simulator=simulator,
+        bull_env=bull_env,
+        bear_env=bear_env,
+        bull_npc=bull_npc,
+        bull_norm=bull_norm,
+        bear_npc=bear_npc,
+        bear_norm=bear_norm,
+        current_dt=init_dt,
+        initial_dt=init_dt,  # PASS STORED INITIAL DT
+        recent_prices=prices_buffer
+    )
+
+# --- GLOBAL STOCKS REGISTRY ---
+# TO ADD A NEW STOCK: Simply instantiate simulator + add 1 entry to STOCKS registry.
+STOCKS: Dict[str, StockContext] = {
+    "SPY": build_stock_context(
+        symbol="SPY",
+        interval="1d",
+        simulator=SPYStockSimulator(initial_price=450.0, annual_drift=0.09, base_volatility=0.18),
+        bull_env_cls=SPYOptionsEnvCalls,
+        bear_env_cls=SPYOptionsEnvPuts,
+        bull_model_file="ppo_spy_options_bull_specialist.zip",
+        bull_norm_file="vec_normalize_bull_specialist.pkl",
+        bear_model_file="ppo_spy_options_bear_specialist.zip",
+        bear_norm_file="vec_normalize_bear_specialist.pkl",
+    ),
+    "QQQ": build_stock_context(
+        symbol="QQQ",
+        interval="5m",
+        simulator=QQQStockSimulator(initial_price=380.0, base_volatility=0.22),
+        bull_env_cls=QQQOptionsEnvCalls,
+        bear_env_cls=QQQOptionsEnvPuts,
+        bull_model_file="ppo_spy_options_bull_specialist.zip",
+        bull_norm_file="vec_normalize_bull_specialist.pkl",
+        bear_model_file="ppo_spy_options_bear_specialist.zip",
+        bear_norm_file="vec_normalize_bear_specialist.pkl",
+    )
+}
 
 
 # -------------------------------------------------------------------
-# 3. HELPER FUNCTIONS
+# 3. AGENT STEPPING HELPERS
 # -------------------------------------------------------------------
 
-def parse_npc_action(agent_name, action_vec, current_price, env, prev_contracts=0):
+def parse_npc_action(agent_name: str, action_vec: Any, current_price: float, env: Any, prev_contracts: int = 0) -> str:
     action_type = int(action_vec[0]) if isinstance(action_vec, (list, tuple, np.ndarray)) else int(action_vec)
     price_str = f"${current_price:.2f}"
 
@@ -412,26 +540,21 @@ def parse_npc_action(agent_name, action_vec, current_price, env, prev_contracts=
     elif last_event == "EXPIRED":
         return f"{agent_name}: POSITION EXPIRED @ {price_str}"
 
-    # 1. Did the agent JUST BUY? (Check this BEFORE checking if contracts > 0)
     if action_type in [1, 2] and env.contracts > 0 and prev_contracts == 0:
         opt_type = "CALL" if getattr(env, "pos_type", 1) == 1 or action_type == 1 else "PUT"
         return f"{agent_name}: BOUGHT {opt_type} @ {price_str}"
 
-    # 2. Did the agent JUST CLOSE?
     if prev_contracts > 0 and env.contracts == 0:
         return f"{agent_name}: CLOSED POSITION @ {price_str}"
 
-    # 3. Is the agent CONTINUING TO HOLD an open position?
     if env.contracts > 0:
         pos_label = "Call" if getattr(env, "pos_type", 1) == 1 else "Put"
         return f"{agent_name}: HELD {env.contracts} {pos_label} contract(s) @ {price_str}"
 
-    # 4. Holding cash
     return f"{agent_name}: HELD CASH @ {price_str}"
 
 
-def step_agent(npc, norm_env, env, current_price, agent_name):
-    """Executes a prediction step for a single NPC and formats action output."""
+def step_agent(npc: PPO, norm_env: VecNormalize, env: Any, current_price: float, agent_name: str) -> dict:
     prev_contracts = env.contracts
     raw_obs = env._get_normalized_observation()
     norm_obs = norm_env.normalize_obs(np.array([raw_obs]))
@@ -453,7 +576,42 @@ def step_agent(npc, norm_env, env, current_price, agent_name):
 
 
 # -------------------------------------------------------------------
-# 4. WEBSOCKET LOOP
+# 4. MODULAR REST API ENDPOINTS
+# -------------------------------------------------------------------
+
+@app.get("/api/options-expirations")
+def get_options_expirations(
+    symbol: str = Query("SPY", description="Stock Symbol"),
+    simulated_date: Optional[str] = Query(None, alias="simulated_date")
+):
+    sim_today = parse_sim_date(simulated_date) if simulated_date else STOCKS.get(symbol, STOCKS["SPY"]).current_dt
+    sample_offsets = [0, 1, 7, 14, 30, 45, 60]
+    expirations = [
+        (sim_today + timedelta(days=days)).strftime("%Y-%m-%d")
+        for days in sample_offsets
+    ]
+    return expirations
+
+
+@app.get("/api/options-chain")
+def get_options_chain(
+    symbol: str = Query("SPY", description="Stock Symbol"),
+    current_price: float = Query(..., description="Spot price from WebSocket"),
+    expiration: Optional[str] = Query(None, description="ISO Expiration date (YYYY-MM-DD)")
+):
+    dte = calculate_dte_from_expiration(expiration)
+
+    # Dynamic strike spacing based on stock price magnitude
+    strike_step = 2.5 if current_price < 500 else 5.0
+    center_strike = round(current_price / strike_step) * strike_step
+    strikes = [round(center_strike + (i * strike_step), 2) for i in range(-5, 6)]
+
+    chain = [compute_option_row(current_price, strike, dte=dte) for strike in strikes]
+    return {"symbol": symbol, "chain": chain}
+
+
+# -------------------------------------------------------------------
+# 5. WEBSOCKET LOOP (PARALLEL TICKING FOR ALL STOCKS)
 # -------------------------------------------------------------------
 
 @app.websocket("/ws/stocks")
@@ -461,94 +619,50 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("Frontend client connected!")
 
-    # Reset environments with initial price buffers
-    spy_bull_env.spy_prices = spy_recent_prices.copy()
-    spy_bear_env.spy_prices = spy_recent_prices.copy()
-    spy_bull_env.reset()
-    spy_bear_env.reset()
-
-    qqq_bull_env.stock_prices = qqq_recent_prices.copy()
-    qqq_bear_env.stock_prices = qqq_recent_prices.copy()
-    qqq_bull_env.reset()
-    qqq_bear_env.reset()
-
-    # Initialize simulation dates
-    spy_sim_date = datetime.now().date()
-    qqq_sim_dt = datetime.combine(datetime.now().date(), time(9, 30))
+    # Reset state for all registered stock contexts
+    for ctx in STOCKS.values():
+        ctx.reset_state()
 
     try:
         while True:
-            # --- 1. ADVANCE SIMULATION TIME (CRITICAL FIX) ---
-            spy_sim_date += timedelta(days=1)
-            
-            # Skip weekends for SPY daily charts
-            while spy_sim_date.weekday() in (5, 6):
-                spy_sim_date += timedelta(days=1)
-
-            # Advance QQQ timestamp by 5 minutes
-            qqq_sim_dt = step_5m(qqq_sim_dt)
-
-            # --- 2. STEP SIMULATORS ---
-            spy_price = float(spy_sim.step_day())
-            spy_recent_prices.append(spy_price)
-            if len(spy_recent_prices) > 300:
-                spy_recent_prices.pop(0)
-
-            # Use intraday step method for QQQ instead of step_day()
-            qqq_price = float(qqq_sim.step_5m() if hasattr(qqq_sim, 'step_5m') else qqq_sim.step_day())
-            qqq_recent_prices.append(qqq_price)
-            if len(qqq_recent_prices) > 300:
-                qqq_recent_prices.pop(0)
-
-            # Update env buffers
-            spy_bull_env.spy_prices = spy_recent_prices.copy()
-            spy_bear_env.spy_prices = spy_recent_prices.copy()
-            qqq_bull_env.stock_prices = qqq_recent_prices.copy()
-            qqq_bear_env.stock_prices = qqq_recent_prices.copy()
-
-            # --- 3. STEP NPCS ---
-            spy_bull_data = step_agent(spy_bull_npc, spy_bull_norm, spy_bull_env, spy_price, "SPY_Bull_NPC")
-            spy_bear_data = step_agent(spy_bear_npc, spy_bear_norm, spy_bear_env, spy_price, "SPY_Bear_NPC")
-
-            qqq_bull_data = step_agent(qqq_bull_npc, qqq_bull_norm, qqq_bull_env, qqq_price, "QQQ_Bull_NPC_5m")
-            qqq_bear_data = step_agent(qqq_bear_npc, qqq_bear_norm, qqq_bear_env, qqq_price, "QQQ_Bear_NPC_5m")
-
-            # Collect active trade logs
+            dates_payload = {}
+            data_payload = {}
+            npcs_payload = {}
             active_logs = []
-            all_npc_data = [
-                ("SPY", spy_bull_data), ("SPY", spy_bear_data),
-                ("QQQ", qqq_bull_data), ("QQQ", qqq_bear_data)
-            ]
 
-            for symbol, data in all_npc_data:
-                action_str = data.get("action", "")
-                if any(keyword in action_str for keyword in ["BOUGHT", "CLOSED", "LIQUIDATED", "EXPIRED"]):
-                    active_logs.append({
-                        "text": action_str,
-                        "symbol": symbol
-                    })
+            # Tick ALL registered stocks in parallel every iteration
+            for symbol, ctx in STOCKS.items():
+                price = ctx.step()
 
-            # --- 4. BUILD & TRANSMIT WEBSOCKET PACKET ---
+                # Step Agents for this stock
+                bull_data = step_agent(ctx.bull_npc, ctx.bull_norm, ctx.bull_env, price, f"{symbol}_Bull_NPC")
+                bear_data = step_agent(ctx.bear_npc, ctx.bear_norm, ctx.bear_env, price, f"{symbol}_Bear_NPC")
+
+                # Record Payloads
+                dates_payload[symbol] = ctx.get_formatted_time()
+                data_payload[symbol] = round(price, 2)
+                npcs_payload[symbol] = {
+                    "bull": bull_data,
+                    "bear": bear_data
+                }
+
+                # Collect Active Trade Logs across all stocks
+                # Include ALL actions, or add "HELD" to the keyword filter
+                for data in [bull_data, bear_data]:
+                    action_str = data.get("action", "")
+                    # Add HELD if you want continuous updates every 3 seconds
+                    if any(kw in action_str for kw in ["BOUGHT", "CLOSED", "LIQUIDATED", "EXPIRED", "HELD"]):
+                        active_logs.append({
+                            "text": action_str,
+                            "symbol": symbol
+                        })
+
+            # Consolidated Packet for ALL symbols
             packet = {
                 "timestamp": int(time_module.time()),
-                "dates": {
-                    "SPY": spy_sim_date.strftime("%Y-%m-%d"),
-                    "QQQ": qqq_sim_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                },
-                "data": {
-                    "SPY": round(spy_price, 2),
-                    "QQQ": round(qqq_price, 2),
-                },
-                "npcs": {
-                    "SPY": {
-                        "bull": spy_bull_data,
-                        "bear": spy_bear_data,
-                    },
-                    "QQQ": {
-                        "bull": qqq_bull_data,
-                        "bear": qqq_bear_data,
-                    },
-                },
+                "dates": dates_payload,
+                "data": data_payload,
+                "npcs": npcs_payload,
                 "logs": active_logs
             }
 

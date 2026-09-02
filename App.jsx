@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { createChart, LineSeries, AreaSeries, CandlestickSeries } from 'lightweight-charts';
+import { createChart, LineSeries, CandlestickSeries } from 'lightweight-charts';
 import { OptionsChain, PositionsTable } from "./OptionsChainModal";
 import { SideTabs } from './SideTabs';
 
@@ -12,72 +12,78 @@ const parseSimDate = (dateVal) => {
   return new Date(dateVal);
 };
 
-// Helper to calculate Days To Expiration (DTE) relative to simulator date
+// Check if timestamp string represents intraday (has non-zero time)
+const isIntradayDate = (dateStr) => {
+  if (!dateStr || typeof dateStr !== 'string') return false;
+  if (!dateStr.includes(':')) return false;
+  const timePart = dateStr.split(' ')[1] || dateStr.split('T')[1];
+  return timePart && !timePart.startsWith('00:00:00');
+};
+
+// Standardize date format for Lightweight Charts (supports both Intraday and Daily Unix Timestamps)
+const normalizeChartTime = (dateStr) => {
+  if (!dateStr) return null;
+  const parsed = new Date(typeof dateStr === 'string' ? dateStr.replace(' ', 'T') : dateStr);
+  if (isNaN(parsed.getTime())) return null;
+
+  // Return Unix timestamp in seconds to handle both daily and intraday progression granularly
+  return Math.floor(parsed.getTime() / 1000);
+};
+
 const calculateSimDTE = (expirationStr, currentSimDateStr) => {
   if (!expirationStr || !currentSimDateStr) return 0;
-  const exp = parseSimDate(expirationStr);
-  const curr = parseSimDate(currentSimDateStr);
-  
-  exp.setHours(0, 0, 0, 0);
-  curr.setHours(0, 0, 0, 0);
 
-  const diffTime = exp.getTime() - curr.getTime();
-  return Math.max(-1, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
+  const currISO = typeof currentSimDateStr === 'string' 
+    ? currentSimDateStr.replace(' ', 'T') 
+    : currentSimDateStr;
+  
+  const curr = new Date(currISO);
+
+  const expDateOnly = typeof expirationStr === 'string' 
+    ? expirationStr.split('T')[0].split(' ')[0] 
+    : expirationStr;
+
+  const exp = new Date(`${expDateOnly}T16:00:00`);
+
+  const diffMs = exp.getTime() - curr.getTime();
+  return diffMs / (1000 * 60 * 60 * 24);
 };
 
 export default function App() {
   const chartContainerRef = useRef(null);
   const seriesRef = useRef(null);
   const chartRef = useRef(null);
+  const seriesTypeRef = useRef('line');
   
-  // Ticker Selection ('SPY' or 'QQQ')
+  // Dynamic Stock Registry State
+  const [availableSymbols, setAvailableSymbols] = useState(['SPY', 'QQQ']);
   const [selectedSymbol, setSelectedSymbol] = useState('SPY');
   
-  // Ref to track current symbol inside persistent WebSocket callback
   const selectedSymbolRef = useRef(selectedSymbol);
   useEffect(() => {
     selectedSymbolRef.current = selectedSymbol;
   }, [selectedSymbol]);
 
-  // Ref tracking to enforce strictly increasing timestamps for Lightweight Charts
-  const spyLastTimeRef = useRef(0);
-  const qqqLastTimeRef = useRef(0);
+  // Master historical buffers for dynamically registered symbols
+  const historyMapRef = useRef({});
+  const currentCandleMapRef = useRef({});
 
-  // Persistent history refs
-  const spyHistoryRef = useRef([]); // Stores SPY line data [{ time, value }]
-  const qqqHistoryRef = useRef([]); // Stores QQQ candlestick data [{ time, open, high, low, close }]
-  const currentCandleRef = useRef(null); // Tracks active QQQ candle
-
-  // Multi-stock state tracking
-  const [marketPrices, setMarketPrices] = useState({ SPY: 450.0, QQQ: 380.0 });
-  const [priceChanges, setPriceChanges] = useState({ SPY: 0, QQQ: 0 });
-  const [simulatedDates, setSimulatedDates] = useState({ SPY: '', QQQ: '' });
+  // Dynamic Price & Date State Maps
+  const [marketPrices, setMarketPrices] = useState({});
+  const [priceChanges, setPriceChanges] = useState({});
+  const [simulatedDates, setSimulatedDates] = useState({});
   
   const [logs, setLogs] = useState([]);
-  
-  // Player state
   const [openPositions, setOpenPositions] = useState([]);
   const [closedPositions, setClosedPositions] = useState([]);
   const [activePositionsTab, setActivePositionsTab] = useState('OPEN');
   const [accountBalance, setAccountBalance] = useState(10000.0);
-
-  // Multi-stock NPC metrics
-  const [npcStats, setNpcStats] = useState({
-    SPY: {
-      bull: { portfolio_value: 10000, cash: 10000, contracts: 0 },
-      bear: { portfolio_value: 10000, cash: 10000, contracts: 0 },
-    },
-    QQQ: {
-      bull: { portfolio_value: 10000, cash: 10000, contracts: 0 },
-      bear: { portfolio_value: 10000, cash: 10000, contracts: 0 },
-    }
-  });
+  const [npcStats, setNpcStats] = useState({});
 
   const currentPrice = marketPrices[selectedSymbol] || 0;
   const priceChange = priceChanges[selectedSymbol] || 0;
   const simulatedDate = simulatedDates[selectedSymbol] || '';
 
-  // Handle new trade execution
   const handleExecuteTrade = (tradeData) => {
     const newPosition = {
       id: `pos_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
@@ -100,7 +106,6 @@ export default function App() {
     ]);
   };
 
-  // Handle manual position close
   const handleClosePosition = (positionId, currentMark) => {
     const targetPos = openPositions.find((p) => p.id === positionId);
     if (!targetPos) return;
@@ -123,9 +128,9 @@ export default function App() {
     setAccountBalance((prev) => prev + finalPayout);
   };
 
-  // Auto-close expired positions based on current simulation date
+  // Option Expiration Evaluator
   useEffect(() => {
-    if (!openPositions || openPositions.length === 0 || !simulatedDate) return;
+    if (!openPositions || openPositions.length === 0) return;
 
     const remainingOpen = [];
     const newlyClosed = [];
@@ -133,16 +138,18 @@ export default function App() {
 
     openPositions.forEach((pos) => {
       const activeDate = simulatedDates[pos.symbol] || simulatedDate;
+      if (!activeDate) {
+        remainingOpen.push(pos);
+        return;
+      }
+
       const dte = calculateSimDTE(pos.expiration, activeDate);
       const activePrice = marketPrices[pos.symbol] || currentPrice;
 
       if (dte < 0) {
-        let intrinsicPrice = 0;
-        if (pos.type === 'CALL') {
-          intrinsicPrice = Math.max(0, activePrice - pos.strike);
-        } else {
-          intrinsicPrice = Math.max(0, pos.strike - activePrice);
-        }
+        const intrinsicPrice = pos.type === 'CALL' 
+          ? Math.max(0, activePrice - pos.strike)
+          : Math.max(0, pos.strike - activePrice);
 
         const finalPayout = intrinsicPrice * 100 * pos.contracts;
         const realizedPnl = finalPayout - pos.totalCost;
@@ -158,7 +165,7 @@ export default function App() {
           closedAt: activeDate,
         });
       } else {
-        remainingOpen.push({ ...pos, dte });
+        remainingOpen.push({ ...pos, dte: Math.max(0, Math.ceil(dte)) });
       }
     });
 
@@ -169,18 +176,14 @@ export default function App() {
     }
   }, [simulatedDates, marketPrices]);
 
-  // --- 1. PERSISTENT WEBSOCKET CONNECTION (MOUNT ONCE) ---
+  // Dynamic WebSocket Feed & Stock Registry Updates
   useEffect(() => {
     let isMounted = true;
     const ws = new WebSocket('ws://localhost:8000/ws/stocks');
 
     ws.onopen = () => {
-      // If React unmounted while the handshake was in-flight, close cleanly now that it's OPEN
-      if (!isMounted) {
-        ws.close();
-        return;
-      }
-      console.log('Connected to Stock WS');
+      if (!isMounted) return ws.close();
+      console.log('Connected to Multi-Stock WS Feed');
     };
 
     ws.onmessage = (event) => {
@@ -189,138 +192,113 @@ export default function App() {
       try {
         const packet = JSON.parse(event.data);
 
+        // 1. Dynamic Registry Update (Dates & Symbol Registration)
         if (packet.dates) {
-          setSimulatedDates({
-            SPY: packet.dates.SPY || '',
-            QQQ: packet.dates.QQQ || '',
-          });
+          setSimulatedDates(packet.dates);
+          const incomingSymbols = Object.keys(packet.dates);
+          if (incomingSymbols.length > 0) {
+            setAvailableSymbols((prev) => Array.from(new Set([...prev, ...incomingSymbols])));
+          }
         }
 
+        // 2. Dynamic Price & Data Access Processing
         if (packet.data) {
           setMarketPrices((prev) => {
-            const nextSpy = packet.data.SPY ?? prev.SPY;
-            const nextQqq = packet.data.QQQ ?? prev.QQQ;
-            setPriceChanges({
-              SPY: nextSpy - prev.SPY,
-              QQQ: nextQqq - prev.QQQ,
+            const newChanges = {};
+            Object.keys(packet.data).forEach((sym) => {
+              const oldPrice = prev[sym] ?? packet.data[sym];
+              newChanges[sym] = packet.data[sym] - oldPrice;
             });
-            return { SPY: nextSpy, QQQ: nextQqq };
+            setPriceChanges(newChanges);
+            return packet.data;
+          });
+
+          // Continuous Background Data Access & Chart Buffering for ALL registered symbols
+          Object.keys(packet.data).forEach((sym) => {
+            const symPrice = packet.data[sym];
+            const symDateStr = packet.dates?.[sym];
+            if (symPrice === undefined || !symDateStr) return;
+
+            if (!historyMapRef.current[sym]) {
+              historyMapRef.current[sym] = [];
+            }
+
+            const timestampSec = normalizeChartTime(symDateStr);
+            if (!timestampSec) return;
+
+            const history = historyMapRef.current[sym];
+            const lastPoint = history[history.length - 1];
+            const isIntraday = isIntradayDate(symDateStr);
+
+            if (!isIntraday) {
+              // Line Series Mode
+              const newPoint = { time: timestampSec, value: symPrice };
+
+              if (!lastPoint || lastPoint.time < timestampSec) {
+                history.push(newPoint);
+                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'line') {
+                  seriesRef.current.update(newPoint);
+                }
+              } else if (lastPoint.time === timestampSec) {
+                history[history.length - 1] = newPoint;
+                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'line') {
+                  seriesRef.current.update(newPoint);
+                }
+              }
+            } else {
+              // Candlestick Mode (5-min buckets)
+              const bucketInterval = 300; 
+              const candleTime = Math.floor(timestampSec / bucketInterval) * bucketInterval;
+              let activeCandle = currentCandleMapRef.current[sym];
+
+              if (!activeCandle || candleTime > activeCandle.time) {
+                const prevClose = activeCandle ? activeCandle.close : symPrice;
+                const newCandle = {
+                  time: candleTime,
+                  open: prevClose,
+                  high: Math.max(prevClose, symPrice),
+                  low: Math.min(prevClose, symPrice),
+                  close: symPrice,
+                };
+
+                history.push(newCandle);
+                currentCandleMapRef.current[sym] = newCandle;
+
+                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'candlestick') {
+                  seriesRef.current.update(newCandle);
+                }
+              } else if (candleTime === activeCandle.time) {
+                const updatedCandle = {
+                  ...activeCandle,
+                  high: Math.max(activeCandle.high, symPrice),
+                  low: Math.min(activeCandle.low, symPrice),
+                  close: symPrice,
+                };
+
+                if (history.length > 0) {
+                  history[history.length - 1] = updatedCandle;
+                }
+                currentCandleMapRef.current[sym] = updatedCandle;
+
+                if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'candlestick') {
+                  seriesRef.current.update(updatedCandle);
+                }
+              }
+            }
           });
         }
-
-        // --- UPDATE SPY HISTORY (Daily Line / Area Series) ---
-        const spyPrice = packet.data?.SPY;
-        const spyDateStr = packet.dates?.SPY; // Format: "YYYY-MM-DD"
-
-        if (spyPrice !== undefined && spyPrice !== null && spyDateStr) {
-          const history = spyHistoryRef.current;
-          const lastPoint = history[history.length - 1];
-
-          if (!lastPoint || lastPoint.time < spyDateStr) {
-            // New date -> Push new point
-            const newPoint = { time: spyDateStr, value: spyPrice };
-            history.push(newPoint);
-
-            if (selectedSymbolRef.current === 'SPY' && seriesRef.current) {
-              seriesRef.current.update(newPoint);
-            }
-          } else if (lastPoint.time === spyDateStr) {
-            // Same date -> Update today's active price
-            const updatedPoint = { time: spyDateStr, value: spyPrice };
-            history[history.length - 1] = updatedPoint;
-
-            if (selectedSymbolRef.current === 'SPY' && seriesRef.current) {
-              seriesRef.current.update(updatedPoint);
-            }
-          }
-        }
-
-        // --- UPDATE QQQ HISTORY (5-Minute Candlestick Series) ---
-        const qqqPrice = packet.data?.QQQ;
-        const qqqDateStr = packet.dates?.QQQ; // Format: "YYYY-MM-DD HH:mm:ss" or ISO
-
-        if (qqqPrice !== undefined && qqqPrice !== null && qqqDateStr) {
-          // Replace space with 'T' for reliable parsing across browsers
-          const qqqTimeSec = Math.floor(new Date(qqqDateStr.replace(' ', 'T')).getTime() / 1000);
-
-          if (!isNaN(qqqTimeSec) && qqqTimeSec > 0) {
-            const bucketInterval = 300; // 5 minutes = 300s
-            const candleTime = Math.floor(qqqTimeSec / bucketInterval) * bucketInterval;
-            let activeCandle = currentCandleRef.current;
-
-            // Reject out-of-order historical packets if they go backward in time
-            if (!activeCandle || candleTime > activeCandle.time) {
-              const prevClose = activeCandle ? activeCandle.close : qqqPrice;
-              const newCandle = {
-                time: candleTime,
-                open: prevClose,
-                high: Math.max(prevClose, qqqPrice),
-                low: Math.min(prevClose, qqqPrice),
-                close: qqqPrice,
-              };
-              
-              qqqHistoryRef.current.push(newCandle);
-              currentCandleRef.current = newCandle;
-
-              if (selectedSymbolRef.current === 'QQQ' && seriesRef.current) {
-                seriesRef.current.update(newCandle);
-              }
-            } else if (candleTime === activeCandle.time) {
-              // Update ongoing active 5-minute candle
-              const updatedCandle = {
-                ...activeCandle,
-                high: Math.max(activeCandle.high, qqqPrice),
-                low: Math.min(activeCandle.low, qqqPrice),
-                close: qqqPrice,
-              };
-
-              qqqHistoryRef.current[qqqHistoryRef.current.length - 1] = updatedCandle;
-              currentCandleRef.current = updatedCandle;
-
-              if (selectedSymbolRef.current === 'QQQ' && seriesRef.current) {
-                seriesRef.current.update(updatedCandle);
-              }
-            }
-          }
-        }
-
-        // --- NPC STATS ---
-        if (packet.npcs) {
-          setNpcStats({
-            SPY: packet.npcs.SPY || { bull: {}, bear: {} },
-            QQQ: packet.npcs.QQQ || { bull: {}, bear: {} },
-          });
-        }
-
-        // --- TRADE ACTIVITY LOGS ---
-        let incomingLogs = packet.logs || packet.trades || packet.npc_trades || packet.activity || packet.messages || [];
 
         if (packet.npcs) {
-          ['SPY', 'QQQ'].forEach((sym) => {
-            if (packet.npcs[sym]?.logs) incomingLogs = incomingLogs.concat(packet.npcs[sym].logs);
-            if (packet.npcs[sym]?.trades) incomingLogs = incomingLogs.concat(packet.npcs[sym].trades);
-            if (packet.npcs[sym]?.activity) incomingLogs = incomingLogs.concat(packet.npcs[sym].activity);
-          });
+          setNpcStats(packet.npcs);
         }
 
-        if (incomingLogs && Array.isArray(incomingLogs) && incomingLogs.length > 0) {
-          const formattedNewLogs = incomingLogs.map((item, idx) => {
-            const rawText = typeof item === 'string' ? item : (item.text || item.message || item.trade || JSON.stringify(item));
-            
-            let logSymbol = item.symbol || item.ticker || item.asset;
-            if (!logSymbol) {
-              if (rawText.includes('QQQ')) logSymbol = 'QQQ';
-              else if (rawText.includes('SPY')) logSymbol = 'SPY';
-              else logSymbol = selectedSymbolRef.current;
-            }
-
-            return {
-              id: `log_ws_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 4)}`,
-              text: rawText,
-              symbol: logSymbol,
-              isDivider: item.isDivider || false
-            };
-          });
+        if (packet.logs && Array.isArray(packet.logs) && packet.logs.length > 0) {
+          const formattedNewLogs = packet.logs.map((item, idx) => ({
+            id: `log_ws_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 4)}`,
+            text: typeof item === 'string' ? item : item.text,
+            symbol: item.symbol || selectedSymbolRef.current,
+            isDivider: item.isDivider || false
+          }));
 
           setLogs((prev) => [...formattedNewLogs, ...prev].slice(0, 100));
         }
@@ -333,17 +311,15 @@ export default function App() {
     return () => {
       isMounted = false;
       ws.onmessage = null;
-
       if (ws.readyState === WebSocket.OPEN) {
         ws.close();
       } else if (ws.readyState === WebSocket.CONNECTING) {
-        // Defer closing until the connection finishes establishing to prevent browser console warning
         ws.onopen = () => ws.close();
       }
     };
   }, []);
 
-  // --- 2. RENDER CHART UPON SYMBOL SELECTION ---
+  // Sync Chart Rendering dynamically on symbol selection or mode change
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -362,13 +338,17 @@ export default function App() {
       timeScale: {
         borderColor: 'rgba(197, 203, 206, 0.8)',
         timeVisible: true,
-        secondsVisible: true,
+        secondsVisible: false,
       },
       localization: { dateFormat: 'yyyy-MM-dd' }
     });
 
+    const activeDateStr = simulatedDates[selectedSymbol] || '';
+    const isIntraday = isIntradayDate(activeDateStr);
+
     let series;
-    if (selectedSymbol === 'SPY') {
+    if (!isIntraday) {
+      seriesTypeRef.current = 'line';
       series = typeof chart.addAreaSeries === 'function'
         ? chart.addAreaSeries({
             topColor: 'rgba(38, 166, 154, 0.56)',
@@ -377,11 +357,8 @@ export default function App() {
             lineWidth: 2,
           })
         : chart.addSeries(LineSeries, { color: '#26a69a', lineWidth: 2 });
-
-      if (spyHistoryRef.current.length > 0) {
-        series.setData(spyHistoryRef.current);
-      }
     } else {
+      seriesTypeRef.current = 'candlestick';
       series = typeof chart.addCandlestickSeries === 'function'
         ? chart.addCandlestickSeries({
             upColor: '#26a69a',
@@ -397,10 +374,12 @@ export default function App() {
             wickUpColor: '#26a69a',
             wickDownColor: '#ef5350',
           });
+    }
 
-      if (qqqHistoryRef.current.length > 0) {
-        series.setData(qqqHistoryRef.current);
-      }
+    // Hydrate chart from dynamic history map buffer
+    const cachedHistory = historyMapRef.current[selectedSymbol] || [];
+    if (cachedHistory.length > 0) {
+      series.setData(cachedHistory);
     }
 
     chartRef.current = chart;
@@ -419,16 +398,14 @@ export default function App() {
       chartRef.current = null;
       chart.remove();
     };
-  }, [selectedSymbol]);
+  }, [selectedSymbol, isIntradayDate(simulatedDates[selectedSymbol])]);
 
   const activeNpc = npcStats[selectedSymbol] || { bull: {}, bear: {} };
 
-  // Filter logs for selected ticker
   const filteredLogs = logs.filter(
     (log) => !log.symbol || log.symbol === selectedSymbol
   );
 
-  // --- View: Dashboard Tab ---
   const dashboardView = (
     <>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', borderBottom: '1px solid #1e293b', paddingBottom: '16px' }}>
@@ -437,33 +414,37 @@ export default function App() {
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
             QuantWorld Sandbox
           </h1>
-          <p style={{ margin: '4px 0 0 0', color: '#94a3b8', fontSize: '14px' }}>Multi-Asset GBM Simulator + RL Agent Speculation</p>
+          <p style={{ margin: '4px 0 0 0', color: '#94a3b8', fontSize: '14px' }}>Multi-Asset Modular Sandbox & RL Speculation</p>
         </div>
 
-        {/* Ticker Selector Buttons */}
-        <div style={{ display: 'flex', gap: '8px', backgroundColor: '#0f172a', padding: '4px', borderRadius: '8px', border: '1px solid #1e293b' }}>
-          {['SPY', 'QQQ'].map((symbol) => (
-            <button
-              key={symbol}
-              onClick={() => setSelectedSymbol(symbol)}
-              style={{
-                padding: '6px 16px',
-                borderRadius: '6px',
-                border: 'none',
-                backgroundColor: selectedSymbol === symbol ? '#38bdf8' : 'transparent',
-                color: selectedSymbol === symbol ? '#0f172a' : '#94a3b8',
-                fontWeight: 'bold',
-                cursor: 'pointer',
-                fontSize: '13px',
-                transition: 'all 0.2s',
-              }}
-            >
-              {symbol} {symbol === 'QQQ' ? '(5m Candles)' : '(Ticks)'}
-            </button>
-          ))}
+        {/* Dynamic Stock Registry Dropdown */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <label style={{ color: '#94a3b8', fontSize: '13px', fontWeight: 'bold' }}>Asset:</label>
+          <select
+            value={selectedSymbol}
+            onChange={(e) => setSelectedSymbol(e.target.value)}
+            style={{
+              padding: '8px 16px',
+              borderRadius: '6px',
+              border: '1px solid #334155',
+              backgroundColor: '#0f172a',
+              color: '#38bdf8',
+              fontWeight: 'bold',
+              cursor: 'pointer',
+              fontSize: '14px',
+              outline: 'none',
+              boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)',
+            }}
+          >
+            {availableSymbols.map((symbol) => (
+              <option key={symbol} value={symbol} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>
+                {symbol}
+              </option>
+            ))}
+          </select>
         </div>
         
-        {currentPrice !== null && (
+        {currentPrice !== 0 && (
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: '12px', color: '#38bdf8', fontWeight: 'bold' }}>
               SIM DATE ({selectedSymbol}): {simulatedDate ? String(simulatedDate) : 'Connecting...'}
@@ -479,20 +460,18 @@ export default function App() {
       </header>
 
       <div style={{ display: 'grid', gridTemplateColumns: '3fr 1fr', gap: '24px' }}>
-        {/* Left Side: Chart */}
         <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '16px', border: '1px solid #1e293b' }}>
           <h2 style={{ fontSize: '16px', margin: '0 0 12px 0', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '6px' }}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
-            {selectedSymbol} {selectedSymbol === 'QQQ' ? 'Candlestick Chart (5-min)' : 'Area Chart'}
+            {selectedSymbol} Real-Time Stream
           </h2>
           <div ref={chartContainerRef} style={{ width: '100%' }} />
         </div>
 
-        {/* Right Side: Agent Metrics & Activity Log */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '12px', border: '1px solid #1e293b', borderTop: '3px solid #22c55e' }}>
-              <div style={{ fontSize: '12px', color: '#22c55e', fontWeight: 'bold', textTransform: 'uppercase' }}>Bull Agent ({selectedSymbol})</div>
+              <div style={{ fontSize: '12px', color: '#22c55e', fontWeight: 'bold', textTransform: 'uppercase' }}>Bull Agent</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f8fafc', margin: '4px 0' }}>
                 ${activeNpc.bull?.portfolio_value?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || '10,000.00'}
               </div>
@@ -501,7 +480,7 @@ export default function App() {
             </div>
 
             <div style={{ backgroundColor: '#131722', borderRadius: '8px', padding: '12px', border: '1px solid #1e293b', borderTop: '3px solid #ef4444' }}>
-              <div style={{ fontSize: '12px', color: '#ef4444', fontWeight: 'bold', textTransform: 'uppercase' }}>Bear Agent ({selectedSymbol})</div>
+              <div style={{ fontSize: '12px', color: '#ef4444', fontWeight: 'bold', textTransform: 'uppercase' }}>Bear Agent</div>
               <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f8fafc', margin: '4px 0' }}>
                 ${activeNpc.bear?.portfolio_value?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || '10,000.00'}
               </div>
@@ -520,18 +499,6 @@ export default function App() {
                 <p style={{ color: '#64748b', fontSize: '13px', fontStyle: 'italic' }}>Waiting for trade activity...</p>
               ) : (
                 filteredLogs.map((log) => {
-                  if (log.isDivider) {
-                    return (
-                      <div key={log.id} style={{ display: 'flex', alignItems: 'center', margin: '8px 0', opacity: 0.8 }}>
-                        <div style={{ flexGrow: 1, borderTop: '1px solid #334155' }}></div>
-                        <span style={{ padding: '2px 8px', fontSize: '10px', fontWeight: 'bold', color: '#38bdf8', backgroundColor: '#0f172a', borderRadius: '12px', border: '1px solid #1e293b' }}>
-                          {log.text}
-                        </span>
-                        <div style={{ flexGrow: 1, borderTop: '1px solid #334155' }}></div>
-                      </div>
-                    );
-                  }
-
                   const isPlayer = log.text.startsWith('Player:');
                   const isBuy = log.text.includes('BOUGHT') || log.text.includes('BUY');
                   
@@ -553,7 +520,6 @@ export default function App() {
     </>
   );
 
-  // View: Closed Positions Table
   const closedPositionsView = (
     <div style={{ backgroundColor: '#131722', border: '1px solid #1e293b', borderRadius: '8px', padding: '16px' }}>
       {closedPositions.length === 0 ? (

@@ -136,7 +136,7 @@ export function OptionsChain({
 
   // 2. Fetch Option Chain using symbol, interval & simulatedDate
   const fetchChain = useCallback((sym, tf, price, expDate, simDateStr, showLoader = false) => {
-    if (price == null || isNaN(price) || !expDate) return;
+    if (price == null || !price || price <= 0 || isNaN(price) || !expDate) return;
 
     if (activeFetchControllerRef.current) {
       activeFetchControllerRef.current.abort();
