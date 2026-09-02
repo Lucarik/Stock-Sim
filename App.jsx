@@ -1,10 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, LineSeries, CandlestickSeries } from 'lightweight-charts';
 import { OptionsChain, PositionsTable } from "./OptionsChainModal";
 import { SideTabs } from './SideTabs';
 import { calculateSMA, calculateVWAP } from './helper1';
 
-// Check if timestamp string represents intraday (has non-zero time)
 const isIntradayDate = (dateStr) => {
   if (!dateStr || typeof dateStr !== 'string') return false;
   if (!dateStr.includes(':')) return false;
@@ -12,7 +11,6 @@ const isIntradayDate = (dateStr) => {
   return timePart && !timePart.startsWith('00:00:00');
 };
 
-// Standardize date format for Lightweight Charts (supports both Intraday and Daily Unix Timestamps)
 const normalizeChartTime = (dateStr) => {
   if (!dateStr) return null;
 
@@ -61,7 +59,7 @@ export default function App() {
   // Technical Indicator States & Synchronized Refs
   const [showSMA, setShowSMA] = useState(false);
   const [showVWAP, setShowVWAP] = useState(false);
-  const [smaPeriod, setSmaPeriod] = useState(14);
+  const [smaPeriod, setSmaPeriod] = useState(5);
 
   const showSMARef = useRef(showSMA);
   const showVWAPRef = useRef(showVWAP);
@@ -71,14 +69,26 @@ export default function App() {
   useEffect(() => { showVWAPRef.current = showVWAP; }, [showVWAP]);
   useEffect(() => { smaPeriodRef.current = smaPeriod; }, [smaPeriod]);
 
-  // Timeframe Interval State (5m default)
+  // Line Drawing State & Synchronized Ref
+  const [isDrawMode, setIsDrawMode] = useState(false);
+  const [drawnLines, setDrawnLines] = useState([]); // List of completed lines { id, p1: {time, price}, p2: {time, price} }
+  const drawnLinesRef = useRef(drawnLines);
+  useEffect(() => {
+    drawnLinesRef.current = drawnLines;
+  }, [drawnLines]);
+  
+  const [drawingStart, setDrawingStart] = useState(null); // Temp point { time, price, x, y }
+  const [mousePos, setMousePos] = useState(null); // Preview mouse position { x, y }
+  const [renderedSvgLines, setRenderedSvgLines] = useState([]);
+
+  // Timeframe Interval State
   const [selectedInterval, setSelectedInterval] = useState(5);
   const selectedIntervalRef = useRef(selectedInterval);
   useEffect(() => {
     selectedIntervalRef.current = selectedInterval;
   }, [selectedInterval]);
 
-  // Tick Rate Speed State
+  // Tick Speed
   const [tickSpeed, setTickSpeed] = useState(3);
   const wsRef = useRef(null);
 
@@ -116,7 +126,6 @@ export default function App() {
   const simulatedDate = simulatedDates[selectedSymbol] || '';
   const activeNpc = npcStats[selectedSymbol] || { bull: {}, bear: {} };
 
-  // Helper to re-aggregate raw tick data into candles
   const rebuildCandleHistory = (sym, intervalMinutes) => {
     const ticks = rawTicksMapRef.current[sym] || [];
     if (ticks.length === 0) return [];
@@ -177,7 +186,6 @@ export default function App() {
     return candles;
   };
 
-  // Live real-time indicator update handler
   const updateIndicatorsOnTick = (candles) => {
     if (!candles || candles.length === 0) return;
 
@@ -202,13 +210,96 @@ export default function App() {
     }
   };
 
-  // Dynamic Indicator Series Toggle (adds/removes series without recreating chart)
+  // Convert Time/Price coordinates to Canvas X/Y pixel values using ref to avoid stale closures
+  const recalculateSvgLines = useCallback(() => {
+    if (!chartRef.current || !seriesRef.current) return;
+
+    const timeScale = chartRef.current.timeScale();
+    const activeDrawnLines = drawnLinesRef.current;
+
+    const updated = activeDrawnLines.map((line) => {
+      const x1 = timeScale.timeToCoordinate(line.p1.time);
+      const y1 = seriesRef.current.priceToCoordinate(line.p1.price);
+      const x2 = timeScale.timeToCoordinate(line.p2.time);
+      const y2 = seriesRef.current.priceToCoordinate(line.p2.price);
+
+      return {
+        id: line.id,
+        x1, y1, x2, y2,
+        isValid: x1 !== null && y1 !== null && x2 !== null && y2 !== null
+      };
+    });
+
+    setRenderedSvgLines(updated);
+  }, []);
+
+  // Recalculate drawn line pixel positions whenever chart scrolls/zooms or lines update
+  useEffect(() => {
+    if (!chartRef.current) return;
+
+    const handleTimeScaleChange = () => recalculateSvgLines();
+
+    const timeScale = chartRef.current.timeScale();
+    timeScale.subscribeVisibleLogicalRangeChange(handleTimeScaleChange);
+
+    recalculateSvgLines();
+
+    return () => {
+      if (chartRef.current) {
+        chartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(handleTimeScaleChange);
+      }
+    };
+  }, [drawnLines, selectedSymbol, selectedInterval, recalculateSvgLines]);
+
+  // Handle Canvas Click Events for Drawing Lines
+  const handleChartClick = (e) => {
+    if (!isDrawMode || !chartRef.current || !seriesRef.current) return;
+
+    const rect = chartContainerRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const time = chartRef.current.timeScale().coordinateToTime(x);
+    const price = seriesRef.current.coordinateToPrice(y);
+
+    if (time === null || price === null) return;
+
+    if (!drawingStart) {
+      // First Click: Set Start Point
+      setDrawingStart({ time, price, x, y });
+    } else {
+      // Second Click: Complete Line
+      const newLine = {
+        id: `line_${Date.now()}`,
+        p1: { time: drawingStart.time, price: drawingStart.price },
+        p2: { time, price }
+      };
+
+      setDrawnLines((prev) => [...prev, newLine]);
+      setDrawingStart(null);
+    }
+  };
+
+  const handleMouseMove = (e) => {
+    if (!isDrawMode || !drawingStart) return;
+    const rect = chartContainerRef.current.getBoundingClientRect();
+    setMousePos({
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+    });
+  };
+
+  const handleClearLines = () => {
+    setDrawnLines([]);
+    setDrawingStart(null);
+  };
+
+  // Dynamic Indicator Toggle
   useEffect(() => {
     if (!chartRef.current || seriesTypeRef.current !== 'candlestick') return;
 
     const candleHistory = historyMapRef.current[selectedSymbol] || [];
 
-    // SMA Handling
     if (showSMA) {
       if (!smaSeriesRef.current) {
         smaSeriesRef.current = chartRef.current.addSeries(LineSeries, {
@@ -228,7 +319,6 @@ export default function App() {
       smaSeriesRef.current = null;
     }
 
-    // VWAP Handling
     if (showVWAP) {
       if (!vwapSeriesRef.current) {
         vwapSeriesRef.current = chartRef.current.addSeries(LineSeries, {
@@ -341,7 +431,7 @@ export default function App() {
     }
   }, [simulatedDates, marketPrices]);
 
-  // WebSocket Data Receiver
+  // WebSocket Setup
   useEffect(() => {
     let isMounted = true;
     const ws = new WebSocket('ws://localhost:8000/ws/stocks');
@@ -404,6 +494,7 @@ export default function App() {
 
               if (selectedSymbolRef.current === sym && seriesRef.current && seriesTypeRef.current === 'line') {
                 seriesRef.current.update(newPoint);
+                recalculateSvgLines(); // Keep drawing positions synced on line tick
               }
             } else {
               rawTicksMapRef.current[sym].push({ time: timestampSec, price: symPrice });
@@ -416,6 +507,7 @@ export default function App() {
                 if (seriesRef.current && seriesTypeRef.current === 'candlestick' && activeCandle) {
                   seriesRef.current.update(activeCandle);
                   updateIndicatorsOnTick(updatedCandles);
+                  recalculateSvgLines(); // Keep drawing positions synced on candlestick tick
                 }
               }
             }
@@ -452,9 +544,9 @@ export default function App() {
       }
       wsRef.current = null;
     };
-  }, []); // Run connection setup once
+  }, []);
 
-  // Base Chart Setup and Teardown (Only re-runs on symbol/interval change)
+  // Base Chart Setup
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -528,6 +620,7 @@ export default function App() {
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current && chartContainerRef.current.clientWidth > 0) {
         chartRef.current.applyOptions({ width: chartContainerRef.current.clientWidth });
+        recalculateSvgLines();
       }
     };
     window.addEventListener('resize', handleResize);
@@ -699,8 +792,52 @@ export default function App() {
                 >
                   VWAP
                 </button>
-              </div>
 
+                
+              </div>
+            {/* Drawing Controls */}
+              <button
+                onClick={() => {
+                  setIsDrawMode(!isDrawMode);
+                  setDrawingStart(null);
+                }}
+                style={{
+                  padding: '4px 10px',
+                  background: isDrawMode ? '#0f5428' : '#0f172a',
+                  color: '#fff',
+                  borderRadius: '6px', 
+                  border: '1px solid #1e293b',
+                  cursor: 'pointer',
+                  borderRadius: '4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  fontWeight: 'bold',
+                  fontSize: '12px',
+                }}
+              >
+              ✏️
+              </button>
+
+              {drawnLines.length > 0 && (
+                <button
+                  onClick={handleClearLines}
+                  style={{
+                    padding: '6px 10px',
+                    background: '#570a09',
+                    color: '#fff',
+                    borderRadius: '6px', 
+                    border: '1px solid #1e293b',
+                    cursor: 'pointer',
+                    borderRadius: '4px',
+                    fontWeight: 'bold',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Clear
+                </button>
+              )}
               {/* Interval Selector Controls (Visible only on Intraday Candlestick charts) */}
               {isIntradayActive && (
                 <div style={{ display: 'flex', gap: '4px', backgroundColor: '#0f172a', padding: '2px', borderRadius: '6px', border: '1px solid #1e293b' }}>
@@ -740,7 +877,57 @@ export default function App() {
               )}
             </div>
           </div>
-          <div ref={chartContainerRef} style={{ width: '100%' }} />
+          {/* Main Chart Container with SVG Drawing Overlay */}
+          <div 
+            style={{ position: 'relative', width: '100%', height: '400px' }}
+            onClick={handleChartClick}
+            onMouseMove={handleMouseMove}
+          >
+            <div ref={chartContainerRef} style={{ width: '100%', height: '100%' }} />
+
+            {/* Dynamic Interactive Drawing Canvas */}
+            <svg
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                pointerEvents: isDrawMode ? 'auto' : 'none',
+                cursor: isDrawMode ? 'crosshair' : 'default',
+                zIndex: 10,
+              }}
+            >
+              {/* Render Completed Trend Lines */}
+              {renderedSvgLines.map((line) => {
+                if (!line.isValid) return null;
+                return (
+                  <line
+                    key={line.id}
+                    x1={line.x1}
+                    y1={line.y1}
+                    x2={line.x2}
+                    y2={line.y2}
+                    stroke="#2962FF"
+                    strokeWidth="2"
+                  />
+                );
+              })}
+
+              {/* Render Active Drawing Preview Line */}
+              {isDrawMode && drawingStart && mousePos && (
+                <line
+                  x1={drawingStart.x}
+                  y1={drawingStart.y}
+                  x2={mousePos.x}
+                  y2={mousePos.y}
+                  stroke="#2962FF"
+                  strokeWidth="2"
+                  strokeDasharray="4 4"
+                />
+              )}
+            </svg>
+          </div>
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
