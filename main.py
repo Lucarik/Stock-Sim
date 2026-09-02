@@ -9,6 +9,8 @@ from datetime import date, datetime, timedelta, time
 import zoneinfo
 from pathlib import Path
 from typing import Optional, Union, Dict, List, Any
+import inspect
+import collections
 
 import gymnasium as gym
 import numpy as np
@@ -21,6 +23,8 @@ from gymnasium import spaces
 from pydantic import BaseModel
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+from helpers import SPYOptionsEnvCalls, SPYOptionsEnvPuts, SPYOptionsEnv5m, prepare_spy_5m_data
 
 # Import your simulator and custom options environment
 #from simulator import SPYStockSimulator  # Adjust import path if needed
@@ -266,6 +270,249 @@ class QQQStockSimulator:
             prices.append(self.step_day())
         return np.array(prices)
 
+class QQQ5mStockSimulator:
+    """Simulates realistic 5-minute SPY/QQQ intraday bar data with regime-dependent jump shocks.
+
+    Features:
+    - Dynamic Regime Jumps: Jump probability and severity expand during high-volatility regimes.
+    - Intraday U-shaped volatility & volume profile.
+    - GARCH-like stochastic volatility clustering.
+    - Direct compatibility with StockContext: Returns close, vwap_dist, and iv_rank dynamically.
+    """
+
+    def __init__(
+        self,
+        initial_price: float = 500.0,
+        annual_drift: float = 0.08,
+        base_volatility: float = 0.16,
+        average_daily_volume: int = 50_000_000,
+        base_jump_prob: float = 0.0005,
+        max_history: int = 300,
+    ):
+        self._price = float(initial_price)
+        self.initial_price = float(initial_price)
+        self.max_history = max_history
+
+        # Time step parameters: 252 trading days * 78 five-minute bars = 19,656 bars/year
+        self.bars_per_day = 78
+        self.dt = 1.0 / (252.0 * self.bars_per_day)
+
+        # Drift and Volatility (annualized base)
+        self.mu_base = annual_drift
+        self.sigma_base = base_volatility
+        self.current_sigma = base_volatility
+
+        # Volatility persistence per 5m step
+        self.vol_persistence = 0.998
+
+        # Volume parameters
+        self.avg_daily_vol = average_daily_volume
+        self.avg_bar_vol = self.avg_daily_vol / self.bars_per_day
+
+        # Baseline Jump Parameters
+        self.base_jump_prob = base_jump_prob
+        self.base_jump_mean = -0.002
+        self.base_jump_std = 0.008
+
+        # Tracking intraday bar state
+        self.bar_index_in_day = 0
+
+        # Technical Feature State Tracking (for VWAP and Parkinson Volatility / IV Rank)
+        self.highs = collections.deque([self._price], maxlen=max_history)
+        self.lows = collections.deque([self._price], maxlen=max_history)
+        self.cum_pv = self._price * 1000.0
+        self.cum_vol = 1000.0
+
+    @property
+    def price(self) -> float:
+        """Property fallback for StockContext price extraction."""
+        return self._price
+
+    @price.setter
+    def price(self, val: float):
+        self._price = float(val)
+
+    def _get_intraday_multipliers(self, step_in_day: int) -> tuple[float, float]:
+        """Computes U-shaped volatility and volume curves for market open/close dynamics."""
+        x = step_in_day / (self.bars_per_day - 1)
+        vol_mult = 1.8 - 2.8 * x + 2.8 * (x**2)
+        volu_mult = 2.5 - 4.2 * x + 4.2 * (x**2)
+        return max(0.4, vol_mult), max(0.2, volu_mult)
+
+    def _compute_regime_jump_parameters(self) -> tuple[float, float, float]:
+        """Scales jump probability, mean drop size, and shock variance based on current volatility regime."""
+        vol_ratio = self.current_sigma / self.sigma_base
+        effective_jump_prob = min(0.02, self.base_jump_prob * (vol_ratio**2))
+        effective_jump_mean = self.base_jump_mean * (vol_ratio**1.3)
+        effective_jump_std = self.base_jump_std * vol_ratio
+        return effective_jump_prob, effective_jump_mean, effective_jump_std
+
+    def _calculate_features(
+        self, price: float, high: float, low: float, volume: float
+    ) -> tuple[float, float]:
+        """Calculates running VWAP distance and IV Rank proxy."""
+        # 1. Update Intraday VWAP
+        typical_price = (high + low + price) / 3.0
+        self.cum_pv += typical_price * volume
+        self.cum_vol += volume
+
+        current_vwap = (
+            self.cum_pv / self.cum_vol if self.cum_vol > 0 else price
+        )
+        vwap_dist = float((price - current_vwap) / current_vwap)
+
+        # 2. Parkinson Volatility Proxy for IV Rank (rolling window)
+        self.highs.append(high)
+        self.lows.append(low)
+
+        if len(self.highs) > 5:
+            highs_arr = np.array(self.highs, dtype=np.float32)
+            lows_arr = np.array(self.lows, dtype=np.float32)
+            ratio = np.maximum(highs_arr / np.maximum(lows_arr, 1e-5), 1.0)
+            log_hl = np.log(ratio) ** 2
+            parkinson_vol = np.sqrt(
+                (1.0 / (4.0 * np.log(2.0) * len(highs_arr))) * np.sum(log_hl)
+            )
+            iv_rank = float(np.clip((parkinson_vol - 0.005) / 0.025, 0.0, 1.0))
+        else:
+            iv_rank = 0.5
+
+        return vwap_dist, iv_rank
+
+    def step_bar(self) -> dict[str, float]:
+        """Advances the simulator by 1 five-minute bar and returns metrics."""
+        # Reset VWAP tracking at the start of a new trading day
+        if self.bar_index_in_day == 0:
+            self.cum_pv = 0.0
+            self.cum_vol = 0.0
+
+        vol_mult, volu_mult = self._get_intraday_multipliers(
+            self.bar_index_in_day
+        )
+
+        # 1. Volatility Clustering
+        vol_shock = np.random.normal(0, 1)
+        effective_sigma_base = self.sigma_base * vol_mult
+        self.current_sigma = max(
+            0.04,
+            self.vol_persistence * self.current_sigma
+            + (1.0 - self.vol_persistence) * effective_sigma_base
+            + 0.0035 * abs(vol_shock),
+        )
+
+        # 2. Jump Dynamics
+        jump_prob, jump_mean, jump_std = self._compute_regime_jump_parameters()
+
+        # 3. Drift & Diffusion
+        deviation_from_base = (
+            self._price - self.initial_price
+        ) / self.initial_price
+        trend_pull = -0.05 * deviation_from_base
+        effective_mu = self.mu_base + trend_pull
+
+        epsilon = np.random.normal(0, 1)
+        drift = (effective_mu - 0.5 * (self.current_sigma**2)) * self.dt
+        diffusion = self.current_sigma * np.sqrt(self.dt) * epsilon
+
+        jump = 0.0
+        if np.random.rand() < jump_prob:
+            jump = np.random.normal(jump_mean, jump_std)
+            self.current_sigma += abs(jump) * 2.0
+
+        # 4. Price & Range Synthesis
+        open_price = self._price
+        bar_return = np.exp(drift + diffusion + jump)
+        close_price = max(0.01, open_price * bar_return)
+
+        bar_sigma = self.current_sigma * np.sqrt(self.dt)
+        intrabar_noise_h = abs(np.random.normal(0, bar_sigma * 0.6))
+        intrabar_noise_l = abs(np.random.normal(0, bar_sigma * 0.6))
+
+        high_price = max(open_price, close_price) * (1.0 + intrabar_noise_h)
+        low_price = min(open_price, close_price) * (1.0 - intrabar_noise_l)
+
+        # 5. Volume Synthesis
+        price_change_pct = abs(close_price - open_price) / open_price
+        volume_noise = np.random.lognormal(mean=0, sigma=0.25)
+        bar_volume = float(
+            max(
+                100,
+                int(
+                    self.avg_bar_vol
+                    * volu_mult
+                    * (1.0 + 60.0 * price_change_pct)
+                    * volume_noise
+                ),
+            )
+        )
+
+        # Update State
+        self._price = float(close_price)
+        self.bar_index_in_day = (
+            self.bar_index_in_day + 1
+        ) % self.bars_per_day
+
+        # Compute Technical Features
+        vwap_dist, iv_rank = self._calculate_features(
+            close_price, high_price, low_price, bar_volume
+        )
+
+        return {
+            "open": round(open_price, 2),
+            "high": round(high_price, 2),
+            "low": round(low_price, 2),
+            "close": round(close_price, 2),
+            "volume": bar_volume,
+            "vwap_dist": vwap_dist,
+            "iv_rank": iv_rank,
+        }
+
+    def step_5m(self) -> dict[str, float]:
+        """Explicit alias for StockContext 5-minute interval stepping."""
+        return self.step_bar()
+
+    def generate_5m_dataframe(
+        self, num_days: int = 60, start_date: datetime = None
+    ) -> pd.DataFrame:
+        """Generates a multi-day 5-minute DataFrame formatted for prepare_spy_5m_data."""
+        if start_date is None:
+            start_date = datetime.now() - timedelta(days=int(num_days * 1.5))
+
+        records = []
+        current_curr_date = start_date.date()
+        days_created = 0
+
+        while days_created < num_days:
+            if current_curr_date.weekday() >= 5:
+                current_curr_date += timedelta(days=1)
+                continue
+
+            market_open_dt = datetime.combine(current_curr_date, time(9, 30))
+            self.bar_index_in_day = 0
+
+            for i in range(self.bars_per_day):
+                bar_time = market_open_dt + timedelta(minutes=5 * i)
+                bar_data = self.step_bar()
+                bar_data["timestamp"] = bar_time
+                records.append(bar_data)
+
+            days_created += 1
+            current_curr_date += timedelta(days=1)
+
+        df = pd.DataFrame(records)
+        return df[
+            [
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "vwap_dist",
+                "iv_rank",
+            ]
+        ]
+
 def calculate_trend_signal(price_history, window=20):
     """
     Calculates normalized trend signal: (Price - SMA_20) / SMA_20
@@ -371,11 +618,6 @@ def load_ppo_model_safe(zip_filename: str, vec_env) -> PPO:
 # -------------------------------------------------------------------
 # 2. MODULAR STOCK REGISTRY ARCHITECTURE
 # -------------------------------------------------------------------
-
-# -------------------------------------------------------------------
-# MODULAR STOCK REGISTRY ARCHITECTURE (UPDATED)
-# -------------------------------------------------------------------
-
 @dataclass
 class StockContext:
     symbol: str
@@ -383,70 +625,131 @@ class StockContext:
     simulator: Any
     bull_env: Any
     bear_env: Any
-    bull_npc: PPO
-    bull_norm: VecNormalize
-    bear_npc: PPO
-    bear_norm: VecNormalize
+    bull_npc: Any  # PPO
+    bull_norm: Optional[Any]  # Optional[VecNormalize]
+    bear_npc: Any  # PPO
+    bear_norm: Optional[Any]  # Optional[VecNormalize]
     current_dt: datetime
-    initial_dt: datetime  # STORE INITIAL DATE TO RESTORE ON RESET
+    initial_dt: datetime
     recent_prices: List[float] = field(default_factory=list)
+    recent_vwap_dist: List[float] = field(default_factory=list)
+    recent_iv_rank: List[float] = field(default_factory=list)
+
+    def _sync_env_buffers(self, env: Any):
+        """Pushes rolling price and feature buffers into 1d or 5m environments."""
+        prices_list = self.recent_prices.copy()
+        prices_arr = np.array(prices_list, dtype=np.float32)
+
+        # Standard price updates (1d model compatibility)
+        if hasattr(env, "spy_prices"):
+            env.spy_prices = prices_list
+        if hasattr(env, "raw_spy_prices"):
+            env.raw_spy_prices = prices_list.copy()
+        if hasattr(env, "stock_prices"):
+            env.stock_prices = prices_list.copy()
+
+        # Update pandas DataFrame for 5m models initialized with df_5m
+        if hasattr(env, "df") and isinstance(env.df, pd.DataFrame):
+            n_rows = len(env.df)
+            n_buffer = len(prices_list)
+
+            # Keep DataFrame length matching current rolling buffer length
+            if n_rows != n_buffer:
+                env.df = pd.DataFrame(
+                    {
+                        "close": prices_arr,
+                        "high": prices_arr,
+                        "low": prices_arr,
+                        "volume": [1000.0] * n_buffer,
+                        "vwap_dist": np.array(self.recent_vwap_dist, dtype=np.float32),
+                        "iv_rank": np.array(self.recent_iv_rank, dtype=np.float32),
+                    }
+                )
+            else:
+                env.df["close"] = prices_arr
+                if "vwap_dist" in env.df.columns:
+                    env.df["vwap_dist"] = np.array(
+                        self.recent_vwap_dist, dtype=np.float32
+                    )
+                if "iv_rank" in env.df.columns:
+                    env.df["iv_rank"] = np.array(
+                        self.recent_iv_rank, dtype=np.float32
+                    )
+
+            # Keep env raw price lists perfectly in sync with internal df
+            env.raw_spy_prices = env.df["close"].values.astype(np.float32).tolist()
+            env.spy_prices = env.raw_spy_prices.copy()
 
     def reset_state(self):
-        """Resets price buffers and restores initial datetime for websocket re-connection."""
-        init_price = self.simulator.price
+        """Resets buffers and restores initial state."""
+        init_price = float(getattr(self.simulator, "price", 100.0))
         self.recent_prices = [init_price] * 300
-        
-        # Reset Environments
-        if hasattr(self.bull_env, "spy_prices"):
-            self.bull_env.spy_prices = self.recent_prices.copy()
-            self.bear_env.spy_prices = self.recent_prices.copy()
-        else:
-            self.bull_env.stock_prices = self.recent_prices.copy()
-            self.bear_env.stock_prices = self.recent_prices.copy()
+        self.recent_vwap_dist = [0.0] * 300
+        self.recent_iv_rank = [0.5] * 300
+
+        self._sync_env_buffers(self.bull_env)
+        self._sync_env_buffers(self.bear_env)
 
         self.bull_env.reset()
         self.bear_env.reset()
 
-        # FIX: Restore to saved initial_dt instead of regenerating datetime.now()
         self.current_dt = self.initial_dt
 
     def step(self) -> float:
         """Ticks simulator and advances timestamp regardless of active UI tab."""
+        # 1. Advance Datetime State
         if self.interval == "5m":
             self.current_dt = step_5m(self.current_dt)
-            price = float(self.simulator.step_5m() if hasattr(self.simulator, 'step_5m') else self.simulator.step_day())
         else:
             self.current_dt = step_1d(self.current_dt)
-            price = float(self.simulator.step_day())
 
+        # 2. Extract Price & Technical Features from Simulator
+        vwap_dist = 0.0
+        iv_rank = 0.5
+
+        if hasattr(self.simulator, "step_bar"):
+            res = self.simulator.step_bar()
+        elif hasattr(self.simulator, "step_5m") and self.interval == "5m":
+            res = self.simulator.step_5m()
+        elif hasattr(self.simulator, "step_day"):
+            res = self.simulator.step_day()
+        else:
+            res = getattr(self.simulator, "price", 0.0)
+
+        if isinstance(res, dict):
+            price = float(res.get("close", res.get("price", 0.0)))
+            vwap_dist = float(res.get("vwap_dist", 0.0))
+            iv_rank = float(res.get("iv_rank", 0.5))
+        else:
+            price = float(res)
+
+        # 3. Update Rolling Windows (300-bar max)
         self.recent_prices.append(price)
+        self.recent_vwap_dist.append(vwap_dist)
+        self.recent_iv_rank.append(iv_rank)
+
         if len(self.recent_prices) > 300:
             self.recent_prices.pop(0)
+            self.recent_vwap_dist.pop(0)
+            self.recent_iv_rank.pop(0)
 
-        # Sync updated prices into environments
-        if hasattr(self.bull_env, "spy_prices"):
-            self.bull_env.spy_prices = self.recent_prices.copy()
-            self.bear_env.spy_prices = self.recent_prices.copy()
-        else:
-            self.bull_env.stock_prices = self.recent_prices.copy()
-            self.bear_env.stock_prices = self.recent_prices.copy()
+        # 4. Sync updated prices and dataframes into environments
+        self._sync_env_buffers(self.bull_env)
+        self._sync_env_buffers(self.bear_env)
 
         return price
 
     def get_formatted_time(self) -> str:
-        # 1. Ensure datetime has timezone info (assume UTC if naive)
         if self.current_dt.tzinfo is None:
             utc_dt = self.current_dt.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
         else:
             utc_dt = self.current_dt
 
-        # 2. Convert to US Eastern Time (handles EST/EDT daylight saving shifts automatically)
         eastern_dt = utc_dt.astimezone(zoneinfo.ZoneInfo("America/New_York"))
 
-        # 3. Format string based on chart interval requirement
         if self.interval == "5m":
             return eastern_dt.strftime("%Y-%m-%d %H:%M:%S")
-        
+
         return eastern_dt.strftime("%Y-%m-%d")
 
 
@@ -457,31 +760,88 @@ def build_stock_context(
     bull_env_cls: type,
     bear_env_cls: type,
     bull_model_file: str,
-    bull_norm_file: str,
     bear_model_file: str,
-    bear_norm_file: str
+    bull_norm_file: Optional[str] = None,
+    bear_norm_file: Optional[str] = None,
 ) -> StockContext:
-    """Factory builder for registering any new stock into the runtime context."""
-    init_price = simulator.price
+    """Factory builder for registering any stock model into runtime context."""
+    init_price = float(getattr(simulator, "price", 100.0))
     prices_buffer = [init_price] * 300
+    vwap_buffer = [0.0] * 300
+    iv_buffer = [0.5] * 300
 
-    bull_env = bull_env_cls(spy_prices=prices_buffer) if "spy_prices" in bull_env_cls.__init__.__code__.co_varnames else bull_env_cls(stock_prices=prices_buffer)
-    bear_env = bear_env_cls(spy_prices=prices_buffer) if "spy_prices" in bear_env_cls.__init__.__code__.co_varnames else bear_env_cls(stock_prices=prices_buffer)
+    # Build seed DataFrame for 5m models that require `df_5m` in __init__
+    seed_df = pd.DataFrame(
+        {
+            "close": prices_buffer,
+            "high": prices_buffer,
+            "low": prices_buffer,
+            "volume": [1000.0] * 300,
+            "vwap_dist": vwap_buffer,
+            "iv_rank": iv_buffer,
+        }
+    )
+
+    def instantiate_env(env_cls):
+        sig = inspect.signature(env_cls.__init__)
+        params = sig.parameters
+
+        kwargs = {}
+        if "is_eval" in params:
+            kwargs["is_eval"] = True
+        if "train" in params:
+            kwargs["train"] = False
+
+        # If model expects `df_5m` (5m environment)
+        if "df_5m" in params:
+            kwargs["df_5m"] = seed_df.copy()
+
+        # If model expects raw price lists (1d environment)
+        if "spy_prices" in params:
+            kwargs["spy_prices"] = prices_buffer
+        elif "stock_prices" in params:
+            kwargs["stock_prices"] = prices_buffer
+
+        return env_cls(**kwargs)
+
+    bull_env = instantiate_env(bull_env_cls)
+    bear_env = instantiate_env(bear_env_cls)
 
     bull_vec_env = DummyVecEnv([lambda: bull_env])
     bear_vec_env = DummyVecEnv([lambda: bear_env])
 
-    bull_npc = load_ppo_model_safe(bull_model_file, bull_vec_env)
-    bull_norm = VecNormalize.load(str(MODELS_DIR / bull_norm_file), bull_vec_env)
-    bull_norm.training = False
+    # Handle Bull Agent Normalization
+    if bull_norm_file:
+        bull_norm = VecNormalize.load(
+            str(MODELS_DIR / bull_norm_file), bull_vec_env
+        )
+        bull_norm.training = False
+        bull_eval_env = bull_norm
+    else:
+        bull_norm = None
+        bull_eval_env = bull_vec_env
 
-    bear_npc = load_ppo_model_safe(bear_model_file, bear_vec_env)
-    bear_norm = VecNormalize.load(str(MODELS_DIR / bear_norm_file), bear_vec_env)
-    bear_norm.training = False
+    bull_npc = load_ppo_model_safe(bull_model_file, bull_eval_env)
 
-    # Define base start date (e.g. 300 days in past for daily data to allow history)
-    start_base_date = datetime.now().date() - timedelta(days=300 if interval == "1d" else 0)
-    init_dt = datetime.combine(start_base_date, time(9, 30) if interval == "5m" else time(0, 0))
+    # Handle Bear Agent Normalization
+    if bear_norm_file:
+        bear_norm = VecNormalize.load(
+            str(MODELS_DIR / bear_norm_file), bear_vec_env
+        )
+        bear_norm.training = False
+        bear_eval_env = bear_norm
+    else:
+        bear_norm = None
+        bear_eval_env = bear_vec_env
+
+    bear_npc = load_ppo_model_safe(bear_model_file, bear_eval_env)
+
+    start_base_date = datetime.now().date() - timedelta(
+        days=300 if interval == "1d" else 0
+    )
+    init_dt = datetime.combine(
+        start_base_date, time(9, 30) if interval == "5m" else time(0, 0)
+    )
 
     return StockContext(
         symbol=symbol,
@@ -494,17 +854,21 @@ def build_stock_context(
         bear_npc=bear_npc,
         bear_norm=bear_norm,
         current_dt=init_dt,
-        initial_dt=init_dt,  # PASS STORED INITIAL DT
-        recent_prices=prices_buffer
+        initial_dt=init_dt,
+        recent_prices=prices_buffer,
+        recent_vwap_dist=vwap_buffer,
+        recent_iv_rank=iv_buffer,
     )
 
+
 # --- GLOBAL STOCKS REGISTRY ---
-# TO ADD A NEW STOCK: Simply instantiate simulator + add 1 entry to STOCKS registry.
 STOCKS: Dict[str, StockContext] = {
     "SPY": build_stock_context(
         symbol="SPY",
         interval="1d",
-        simulator=SPYStockSimulator(initial_price=450.0, annual_drift=0.09, base_volatility=0.18),
+        simulator=SPYStockSimulator(
+            initial_price=450.0, annual_drift=0.09, base_volatility=0.18
+        ),
         bull_env_cls=SPYOptionsEnvCalls,
         bear_env_cls=SPYOptionsEnvPuts,
         bull_model_file="ppo_spy_options_bull_specialist.zip",
@@ -515,14 +879,12 @@ STOCKS: Dict[str, StockContext] = {
     "QQQ": build_stock_context(
         symbol="QQQ",
         interval="5m",
-        simulator=QQQStockSimulator(initial_price=380.0, base_volatility=0.22),
-        bull_env_cls=QQQOptionsEnvCalls,
-        bear_env_cls=QQQOptionsEnvPuts,
-        bull_model_file="ppo_spy_options_bull_specialist.zip",
-        bull_norm_file="vec_normalize_bull_specialist.pkl",
-        bear_model_file="ppo_spy_options_bear_specialist.zip",
-        bear_norm_file="vec_normalize_bear_specialist.pkl",
-    )
+        simulator=QQQ5mStockSimulator(initial_price=500.0, annual_drift=0.08),
+        bull_env_cls=SPYOptionsEnv5m,
+        bear_env_cls=SPYOptionsEnv5m,
+        bull_model_file="best_model_bi_v2(110).zip",
+        bear_model_file="best_model_only_puts(135).zip",
+    ),
 }
 
 
@@ -554,14 +916,32 @@ def parse_npc_action(agent_name: str, action_vec: Any, current_price: float, env
     return f"{agent_name}: HELD CASH @ {price_str}"
 
 
-def step_agent(npc: PPO, norm_env: VecNormalize, env: Any, current_price: float, agent_name: str) -> dict:
+def step_agent(
+    npc: PPO, 
+    norm_env: Optional[VecNormalize], 
+    env: Any, 
+    current_price: float, 
+    agent_name: str
+) -> dict:
     prev_contracts = env.contracts
+    
+    # Get raw observation from environment
     raw_obs = env._get_normalized_observation()
-    norm_obs = norm_env.normalize_obs(np.array([raw_obs]))
+    
+    # Ensure vector format for batch inference
+    obs_batch = np.array([raw_obs])
+    
+    # Apply VecNormalize ONLY if a normalization object exists (1-day model)
+    if norm_env is not None:
+        norm_obs = norm_env.normalize_obs(obs_batch)
+    else:
+        norm_obs = obs_batch  # 5-minute model (already normalized internally)
 
+    # Predict action
     action, _ = npc.predict(norm_obs, deterministic=True)
     act_vec = action[0] if action.ndim > 1 else action
 
+    # Advance environment state
     env.step(act_vec)
 
     action_log = parse_npc_action(agent_name, act_vec, current_price, env, prev_contracts=prev_contracts)
