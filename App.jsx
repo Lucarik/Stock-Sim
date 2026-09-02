@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createChart, LineSeries, CandlestickSeries } from 'lightweight-charts';
 import { OptionsChain, PositionsTable } from "./OptionsChainModal";
 import { SideTabs } from './SideTabs';
-import {calculateSMA, calculateVWAP} from './helper1';
+import { calculateSMA, calculateVWAP } from './helper1';
 
 // Check if timestamp string represents intraday (has non-zero time)
 const isIntradayDate = (dateStr) => {
@@ -16,17 +16,13 @@ const isIntradayDate = (dateStr) => {
 const normalizeChartTime = (dateStr) => {
   if (!dateStr) return null;
 
-  // Handle "YYYY-MM-DD HH:MM:SS" (Intraday 5m format)
   if (dateStr.includes(':')) {
     const [datePart, timePart] = dateStr.split(' ');
     const [year, month, day] = datePart.split('-').map(Number);
     const [hours, minutes, seconds] = timePart.split(':').map(Number);
-
-    // Parse as UTC seconds to ensure consistent bucket math across timezones
     return Math.floor(Date.UTC(year, month - 1, day, hours, minutes, seconds) / 1000);
   }
 
-  // Handle "YYYY-MM-DD" (Daily format)
   const [year, month, day] = dateStr.split('-').map(Number);
   return Math.floor(Date.UTC(year, month - 1, day) / 1000);
 };
@@ -39,13 +35,11 @@ const calculateSimDTE = (expirationStr, currentSimDateStr) => {
     : currentSimDateStr;
   
   const curr = new Date(currISO);
-
   const expDateOnly = typeof expirationStr === 'string' 
     ? expirationStr.split('T')[0].split(' ')[0] 
     : expirationStr;
 
   const exp = new Date(`${expDateOnly}T16:00:00`);
-
   const diffMs = exp.getTime() - curr.getTime();
   return diffMs / (1000 * 60 * 60 * 24);
 };
@@ -56,22 +50,38 @@ export default function App() {
   const chartRef = useRef(null);
   const seriesTypeRef = useRef('line');
 
+  // Overlay Line Series Refs
+  const smaSeriesRef = useRef(null);
+  const vwapSeriesRef = useRef(null);
+
   // Dynamic Stock Registry State
   const [availableSymbols, setAvailableSymbols] = useState(['SPY', 'QQQ']);
   const [selectedSymbol, setSelectedSymbol] = useState('SPY');
 
-  // 1. New Timeframe Interval State (5m default)
-  const [selectedInterval, setSelectedInterval] = useState(5); // 5 or 15
+  // Technical Indicator States & Synchronized Refs
+  const [showSMA, setShowSMA] = useState(false);
+  const [showVWAP, setShowVWAP] = useState(false);
+  const [smaPeriod, setSmaPeriod] = useState(14);
+
+  const showSMARef = useRef(showSMA);
+  const showVWAPRef = useRef(showVWAP);
+  const smaPeriodRef = useRef(smaPeriod);
+
+  useEffect(() => { showSMARef.current = showSMA; }, [showSMA]);
+  useEffect(() => { showVWAPRef.current = showVWAP; }, [showVWAP]);
+  useEffect(() => { smaPeriodRef.current = smaPeriod; }, [smaPeriod]);
+
+  // Timeframe Interval State (5m default)
+  const [selectedInterval, setSelectedInterval] = useState(5);
   const selectedIntervalRef = useRef(selectedInterval);
   useEffect(() => {
     selectedIntervalRef.current = selectedInterval;
   }, [selectedInterval]);
 
-  // Tick Rate Speed State (1s, 3s, 5s default options)
-  const [tickSpeed, setTickSpeed] = useState(3); // Default 3 seconds
-  const wsRef = useRef(null); // Ref to hold the active WebSocket connection
+  // Tick Rate Speed State
+  const [tickSpeed, setTickSpeed] = useState(3);
+  const wsRef = useRef(null);
 
-  // Send speed update over existing socket connection
   const handleSpeedChange = (newSpeed) => {
     setTickSpeed(newSpeed);
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -84,7 +94,7 @@ export default function App() {
     selectedSymbolRef.current = selectedSymbol;
   }, [selectedSymbol]);
 
-  // Master historical buffers (rawTicksMap stores raw time/price feeds for dynamic aggregation)
+  // Master historical buffers
   const historyMapRef = useRef({});
   const rawTicksMapRef = useRef({});
   const currentCandleMapRef = useRef({});
@@ -104,27 +114,25 @@ export default function App() {
   const currentPrice = marketPrices[selectedSymbol] || 0;
   const priceChange = priceChanges[selectedSymbol] || 0;
   const simulatedDate = simulatedDates[selectedSymbol] || '';
+  const activeNpc = npcStats[selectedSymbol] || { bull: {}, bear: {} };
 
-  // Helper to re-aggregate raw tick data into 5m or 15m candles dynamically
+  // Helper to re-aggregate raw tick data into candles
   const rebuildCandleHistory = (sym, intervalMinutes) => {
     const ticks = rawTicksMapRef.current[sym] || [];
     if (ticks.length === 0) return [];
 
-    const isDaily = intervalMinutes >= 1440; // 1 day = 1440 mins
+    const isDaily = intervalMinutes >= 1440;
     const candleMap = new Map();
 
-    // 1. Group ticks into simulation timestamp buckets
     ticks.forEach(({ time, price }) => {
       let candleTime;
 
       if (isDaily) {
-        // Bucket by UTC midnight for daily candles
         const date = new Date(time * 1000);
         candleTime = Math.floor(
           Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()) / 1000
         );
       } else {
-        // Bucket by interval seconds (e.g. 5m = 300s, 15m = 900s)
         const bucketInterval = intervalMinutes * 60;
         candleTime = Math.floor(time / bucketInterval) * bucketInterval;
       }
@@ -139,12 +147,10 @@ export default function App() {
       }
     });
 
-    // 2. Sort bucket keys chronologically
     const sortedTimes = Array.from(candleMap.keys()).sort((a, b) => a - b);
     const candles = [];
     let prevClose = null;
 
-    // 3. Construct continuous candles
     sortedTimes.forEach((candleTime) => {
       const { prices } = candleMap.get(candleTime);
       const firstPrice = prices[0];
@@ -160,6 +166,7 @@ export default function App() {
         high: highPrice,
         low: lowPrice,
         close: lastPrice,
+        volume: activeNpc.bull?.volume || 100,
       };
 
       candles.push(candle);
@@ -169,6 +176,78 @@ export default function App() {
     currentCandleMapRef.current[sym] = candles[candles.length - 1] || null;
     return candles;
   };
+
+  // Live real-time indicator update handler
+  const updateIndicatorsOnTick = (candles) => {
+    if (!candles || candles.length === 0) return;
+
+    if (showSMARef.current && smaSeriesRef.current) {
+      const smaData = calculateSMA(candles, Number(smaPeriodRef.current) || 14);
+      if (smaData.length > 0) {
+        const lastPoint = smaData[smaData.length - 1];
+        if (lastPoint && lastPoint.sma !== null && lastPoint.sma !== undefined) {
+          smaSeriesRef.current.update({ time: lastPoint.time, value: lastPoint.sma });
+        }
+      }
+    }
+
+    if (showVWAPRef.current && vwapSeriesRef.current) {
+      const vwapData = calculateVWAP(candles);
+      if (vwapData.length > 0) {
+        const lastPoint = vwapData[vwapData.length - 1];
+        if (lastPoint && lastPoint.vwap !== null && lastPoint.vwap !== undefined) {
+          vwapSeriesRef.current.update({ time: lastPoint.time, value: lastPoint.vwap });
+        }
+      }
+    }
+  };
+
+  // Dynamic Indicator Series Toggle (adds/removes series without recreating chart)
+  useEffect(() => {
+    if (!chartRef.current || seriesTypeRef.current !== 'candlestick') return;
+
+    const candleHistory = historyMapRef.current[selectedSymbol] || [];
+
+    // SMA Handling
+    if (showSMA) {
+      if (!smaSeriesRef.current) {
+        smaSeriesRef.current = chartRef.current.addSeries(LineSeries, {
+          color: '#eab308',
+          lineWidth: 2,
+          //title: `SMA (${smaPeriod})`,
+        });
+      }
+      if (candleHistory.length > 0) {
+        const smaData = calculateSMA(candleHistory, Number(smaPeriod) || 14)
+          .filter((d) => d && d.sma !== null && d.sma !== undefined && !isNaN(d.sma))
+          .map((d) => ({ time: d.time, value: d.sma }));
+        smaSeriesRef.current.setData(smaData);
+      }
+    } else if (smaSeriesRef.current) {
+      chartRef.current.removeSeries(smaSeriesRef.current);
+      smaSeriesRef.current = null;
+    }
+
+    // VWAP Handling
+    if (showVWAP) {
+      if (!vwapSeriesRef.current) {
+        vwapSeriesRef.current = chartRef.current.addSeries(LineSeries, {
+          color: '#a855f7',
+          lineWidth: 2,
+          //title: 'VWAP',
+        });
+      }
+      if (candleHistory.length > 0) {
+        const vwapData = calculateVWAP(candleHistory)
+          .filter((d) => d && d.vwap !== null && d.vwap !== undefined && !isNaN(d.vwap))
+          .map((d) => ({ time: d.time, value: d.vwap }));
+        vwapSeriesRef.current.setData(vwapData);
+      }
+    } else if (vwapSeriesRef.current) {
+      chartRef.current.removeSeries(vwapSeriesRef.current);
+      vwapSeriesRef.current = null;
+    }
+  }, [showSMA, showVWAP, smaPeriod, selectedSymbol]);
 
   const handleExecuteTrade = (tradeData) => {
     const newPosition = {
@@ -262,7 +341,7 @@ export default function App() {
     }
   }, [simulatedDates, marketPrices]);
 
-  // Dynamic WebSocket Feed & Stock Registry Updates
+  // WebSocket Data Receiver
   useEffect(() => {
     let isMounted = true;
     const ws = new WebSocket('ws://localhost:8000/ws/stocks');
@@ -279,7 +358,6 @@ export default function App() {
       try {
         const packet = JSON.parse(event.data);
 
-        // 1. Dynamic Registry Update
         if (packet.dates) {
           setSimulatedDates(packet.dates);
           const incomingSymbols = Object.keys(packet.dates);
@@ -288,7 +366,6 @@ export default function App() {
           }
         }
 
-        // 2. Dynamic Price & Data Access Processing
         if (packet.data) {
           setMarketPrices((prev) => {
             const newChanges = {};
@@ -300,7 +377,6 @@ export default function App() {
             return packet.data;
           });
 
-          // Continuous Background Data Access & Chart Buffering
           Object.keys(packet.data).forEach((sym) => {
             const symPrice = packet.data[sym];
             const symDateStr = packet.dates?.[sym];
@@ -309,21 +385,12 @@ export default function App() {
             if (!historyMapRef.current[sym]) historyMapRef.current[sym] = [];
             if (!rawTicksMapRef.current[sym]) rawTicksMapRef.current[sym] = [];
 
-            const simDateStr = packet.dates[sym]; // e.g., "2026-08-26 09:30:00" or "2026-08-26"
-            const timestampSec = normalizeChartTime(simDateStr);
-
-            if (timestampSec !== null) {
-              // Push the SIMULATED time in seconds into your raw tick buffer
-              rawTicksMapRef.current[sym].push({ time: timestampSec, price: symPrice });
-            }
+            const timestampSec = normalizeChartTime(symDateStr);
             if (!timestampSec) return;
 
             const isIntraday = isIntradayDate(symDateStr);
 
-            // Inside ws.onmessage -> Object.keys(packet.data).forEach((sym) => { ...
-
             if (!isIntraday) {
-              // Line Series Mode
               const history = historyMapRef.current[sym] || [];
               const lastPoint = history[history.length - 1];
               const newPoint = { time: timestampSec, value: symPrice };
@@ -339,10 +406,8 @@ export default function App() {
                 seriesRef.current.update(newPoint);
               }
             } else {
-              // 1. Append raw tick to buffer
               rawTicksMapRef.current[sym].push({ time: timestampSec, price: symPrice });
 
-              // 2. Re-aggregate for active symbol & interval to maintain exact continuous structure
               if (selectedSymbolRef.current === sym) {
                 const updatedCandles = rebuildCandleHistory(sym, selectedIntervalRef.current);
                 historyMapRef.current[sym] = updatedCandles;
@@ -350,6 +415,7 @@ export default function App() {
                 const activeCandle = updatedCandles[updatedCandles.length - 1];
                 if (seriesRef.current && seriesTypeRef.current === 'candlestick' && activeCandle) {
                   seriesRef.current.update(activeCandle);
+                  updateIndicatorsOnTick(updatedCandles);
                 }
               }
             }
@@ -386,9 +452,9 @@ export default function App() {
       }
       wsRef.current = null;
     };
-  }, []);
+  }, []); // Run connection setup once
 
-  // Sync Chart Rendering dynamically on symbol selection, interval, or date mode change
+  // Base Chart Setup and Teardown (Only re-runs on symbol/interval change)
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -449,7 +515,6 @@ export default function App() {
             wickDownColor: '#ef5350',
           });
 
-      // Hydrate dynamically using selected interval (5m vs 15m)
       const candleHistory = rebuildCandleHistory(selectedSymbol, selectedInterval);
       historyMapRef.current[selectedSymbol] = candleHistory;
       if (candleHistory.length > 0) {
@@ -470,12 +535,12 @@ export default function App() {
     return () => {
       window.removeEventListener('resize', handleResize);
       seriesRef.current = null;
+      smaSeriesRef.current = null;
+      vwapSeriesRef.current = null;
       chartRef.current = null;
       chart.remove();
     };
   }, [selectedSymbol, selectedInterval, isIntradayDate(simulatedDates[selectedSymbol])]);
-
-  const activeNpc = npcStats[selectedSymbol] || { bull: {}, bear: {} };
 
   const filteredLogs = logs.filter(
     (log) => !log.symbol || log.symbol === selectedSymbol
@@ -494,56 +559,58 @@ export default function App() {
           <p style={{ margin: '4px 0 0 0', color: '#94a3b8', fontSize: '14px' }}>Multi-Asset Modular Sandbox & RL Speculation</p>
         </div>
 
-        {/* Dynamic Stock Registry Dropdown */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <label style={{ color: '#94a3b8', fontSize: '13px', fontWeight: 'bold' }}>Asset:</label>
-          <select
-            value={selectedSymbol}
-            onChange={(e) => setSelectedSymbol(e.target.value)}
-            style={{
-              padding: '8px 16px',
-              borderRadius: '6px',
-              border: '1px solid #334155',
-              backgroundColor: '#0f172a',
-              color: '#38bdf8',
-              fontWeight: 'bold',
-              cursor: 'pointer',
-              fontSize: '14px',
-              outline: 'none',
-              boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)',
-            }}
-          >
-            {availableSymbols.map((symbol) => (
-              <option key={symbol} value={symbol} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>
-                {symbol}
-              </option>
-            ))}
-          </select>
-        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          {/* Dynamic Stock Registry Dropdown */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <label style={{ color: '#94a3b8', fontSize: '13px', fontWeight: 'bold' }}>Asset:</label>
+            <select
+              value={selectedSymbol}
+              onChange={(e) => setSelectedSymbol(e.target.value)}
+              style={{
+                padding: '6px 12px',
+                borderRadius: '6px',
+                border: '1px solid #334155',
+                backgroundColor: '#0f172a',
+                color: '#38bdf8',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+                fontSize: '13px',
+                outline: 'none',
+                boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)',
+              }}
+            >
+              {availableSymbols.map((symbol) => (
+                <option key={symbol} value={symbol} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>
+                  {symbol}
+                </option>
+              ))}
+            </select>
+          </div>
 
-        {/* Tick Rate Speed Selector Controls */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <label style={{ color: '#94a3b8', fontSize: '13px', fontWeight: 'bold' }}>Speed:</label>
-          <div style={{ display: 'flex', gap: '4px', backgroundColor: '#0f172a', padding: '2px', borderRadius: '6px', border: '1px solid #1e293b' }}>
-            {[1, 3, 5, 50].map((speed) => (
-              <button
-                key={speed}
-                onClick={() => handleSpeedChange(speed)}
-                style={{
-                  padding: '4px 8px',
-                  borderRadius: '4px',
-                  border: 'none',
-                  backgroundColor: tickSpeed === speed ? '#38bdf8' : 'transparent',
-                  color: tickSpeed === speed ? '#0f172a' : '#94a3b8',
-                  fontWeight: 'bold',
-                  fontSize: '12px',
-                  cursor: 'pointer',
-                  transition: 'all 0.2s',
-                }}
-              >
-                {speed}s
-              </button>
-            ))}
+          {/* Tick Rate Speed Selector Controls */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <label style={{ color: '#94a3b8', fontSize: '13px', fontWeight: 'bold' }}>Speed:</label>
+            <div style={{ display: 'flex', gap: '4px', backgroundColor: '#0f172a', padding: '2px', borderRadius: '6px', border: '1px solid #1e293b' }}>
+              {[1, 3, 5, 50].map((speed) => (
+                <button
+                  key={speed}
+                  onClick={() => handleSpeedChange(speed)}
+                  style={{
+                    padding: '4px 8px',
+                    borderRadius: '4px',
+                    border: 'none',
+                    backgroundColor: tickSpeed === speed ? '#38bdf8' : 'transparent',
+                    color: tickSpeed === speed ? '#0f172a' : '#94a3b8',
+                    fontWeight: 'bold',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  {speed}s
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
@@ -570,43 +637,108 @@ export default function App() {
               {selectedSymbol} Real-Time Stream {isIntradayActive && `(${selectedInterval}m)`}
             </h2>
 
-            {/* Interval Selector Controls (Visible only on Intraday Candlestick charts) */}
-            {isIntradayActive && (
-              <div style={{ display: 'flex', gap: '4px', backgroundColor: '#0f172a', padding: '2px', borderRadius: '6px', border: '1px solid #1e293b' }}>
+            {/* Controls Bar for Timeframe Interval & Technical Indicators (SMA/VWAP) */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              {/* Technical Indicator Buttons */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#0f172a', padding: '2px 6px', borderRadius: '6px', border: '1px solid #1e293b' }}>
+                {/* SMA Toggle */}
                 <button
-                  onClick={() => setSelectedInterval(5)}
+                  onClick={() => setShowSMA((prev) => !prev)}
                   style={{
-                    padding: '4px 10px',
+                    padding: '3px 8px',
                     borderRadius: '4px',
                     border: 'none',
-                    backgroundColor: selectedInterval === 5 ? '#38bdf8' : 'transparent',
-                    color: selectedInterval === 5 ? '#0f172a' : '#94a3b8',
-                    fontWeight: 'bold',
+                    backgroundColor: showSMA ? 'rgba(234, 179, 8, 0.25)' : 'transparent',
+                    color: showSMA ? '#fde047' : '#64748b',
                     fontSize: '12px',
+                    fontWeight: 'bold',
                     cursor: 'pointer',
                     transition: 'all 0.2s',
                   }}
                 >
-                  5m
+                  SMA
                 </button>
+
+                {/* Editable SMA Period Input */}
+                {showSMA && (
+                  <input
+                    type="number"
+                    min="1"
+                    max="200"
+                    value={smaPeriod}
+                    onChange={(e) => setSmaPeriod(Math.max(1, parseInt(e.target.value) || 1))}
+                    style={{
+                      width: '42px',
+                      padding: '2px 4px',
+                      borderRadius: '4px',
+                      border: '1px solid #eab308',
+                      backgroundColor: '#131722',
+                      color: '#fde047',
+                      fontSize: '11px',
+                      fontWeight: 'bold',
+                      textAlign: 'center',
+                      outline: 'none',
+                    }}
+                  />
+                )}
+
+                {/* VWAP Toggle */}
                 <button
-                  onClick={() => setSelectedInterval(15)}
+                  onClick={() => setShowVWAP((prev) => !prev)}
                   style={{
-                    padding: '4px 10px',
+                    padding: '3px 8px',
                     borderRadius: '4px',
                     border: 'none',
-                    backgroundColor: selectedInterval === 15 ? '#38bdf8' : 'transparent',
-                    color: selectedInterval === 15 ? '#0f172a' : '#94a3b8',
-                    fontWeight: 'bold',
+                    backgroundColor: showVWAP ? 'rgba(168, 85, 247, 0.25)' : 'transparent',
+                    color: showVWAP ? '#c084fc' : '#64748b',
                     fontSize: '12px',
+                    fontWeight: 'bold',
                     cursor: 'pointer',
                     transition: 'all 0.2s',
                   }}
                 >
-                  15m
+                  VWAP
                 </button>
               </div>
-            )}
+
+              {/* Interval Selector Controls (Visible only on Intraday Candlestick charts) */}
+              {isIntradayActive && (
+                <div style={{ display: 'flex', gap: '4px', backgroundColor: '#0f172a', padding: '2px', borderRadius: '6px', border: '1px solid #1e293b' }}>
+                  <button
+                    onClick={() => setSelectedInterval(5)}
+                    style={{
+                      padding: '4px 10px',
+                      borderRadius: '4px',
+                      border: 'none',
+                      backgroundColor: selectedInterval === 5 ? '#38bdf8' : 'transparent',
+                      color: selectedInterval === 5 ? '#0f172a' : '#94a3b8',
+                      fontWeight: 'bold',
+                      fontSize: '12px',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s',
+                    }}
+                  >
+                    5m
+                  </button>
+                  <button
+                    onClick={() => setSelectedInterval(15)}
+                    style={{
+                      padding: '4px 10px',
+                      borderRadius: '4px',
+                      border: 'none',
+                      backgroundColor: selectedInterval === 15 ? '#38bdf8' : 'transparent',
+                      color: selectedInterval === 15 ? '#0f172a' : '#94a3b8',
+                      fontWeight: 'bold',
+                      fontSize: '12px',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s',
+                    }}
+                  >
+                    15m
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
           <div ref={chartContainerRef} style={{ width: '100%' }} />
         </div>
